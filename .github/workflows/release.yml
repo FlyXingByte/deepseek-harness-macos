@@ -1,0 +1,47 @@
+name: Build prerelease
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  macos-arm64-dmg:
+    runs-on: macos-14
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build app
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/build.sh
+
+      - name: Create and verify DMG
+        run: |
+          ./scripts/create-dmg.sh
+          ./scripts/verify-release.sh
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeepSeek-Harness-macOS-arm64
+          path: |
+            dist/*.dmg
+            dist/*.sha256
+
+      - name: Create GitHub prerelease
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.dmg \
+            dist/*.sha256 \
+            --title "Unofficial macOS Launcher ${GITHUB_REF_NAME}" \
+            --notes-file RELEASE_NOTES.md \
+            --prerelease
