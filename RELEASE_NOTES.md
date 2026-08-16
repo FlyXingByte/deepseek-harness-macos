@@ -1,4 +1,20 @@
-# Unofficial macOS Launcher v2.3
+# Unofficial macOS Launcher v2.3.1
+
+Interaction fix release.
+
+## Fixed
+
+- Added persistent page/font zoom through the native View menu, plus Command-Plus, Command-Minus, and Command-0 shortcuts.
+- Restored the standard macOS title bar so the window can be repositioned by dragging it with the mouse.
+- Kept the embedded Harness content inside the standard content area so WebKit no longer captures title-bar drag gestures.
+
+## Distribution status
+
+This build is distributed as an ad-hoc signed, non-notarized prerelease. On first launch, use Finder → right-click → Open; do not disable Gatekeeper.
+
+---
+
+## v2.3
 
 Initial public beta of the portable macOS launcher.
 
