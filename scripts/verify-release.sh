@@ -32,6 +32,7 @@ done
 /usr/bin/plutil -lint "${APP_PATH}/Contents/Info.plist"
 /usr/bin/codesign --verify --strict --verbose=2 "${APP_PATH}"
 /usr/bin/file "${APP_PATH}/Contents/MacOS/DeepSeekHarnessApp" | /usr/bin/grep -F "arm64" >/dev/null
+"${APP_PATH}/Contents/MacOS/DeepSeekHarnessApp" --self-test
 
 if /usr/bin/strings "${APP_PATH}/Contents/MacOS/DeepSeekHarnessApp" | /usr/bin/grep -E '/Users/[^/]+/(Documents|Desktop|Downloads|Applications|\.codex)/' >/dev/null; then
     print -u2 "Release binary contains a private machine path."

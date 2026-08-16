@@ -1,13 +1,110 @@
 import AppKit
+import Darwin
 import Foundation
 import WebKit
 
 private let appDisplayName = "DeepSeek Harness"
 private let harnessURL = URL(string: "http://127.0.0.1:3080/")!
-private let harnessPackageVersion = "0.1.0-rc.6"
-private let harnessPackageSpecifier = "@deepseek-ai/dsh@\(harnessPackageVersion)"
+private let harnessPackageName = "@deepseek-ai/dsh"
+private let bundledHarnessPackageVersion = "0.1.0-rc.6"
+private let harnessDistTagsURL = URL(string: "https://registry.npmjs.org/-/package/%40deepseek-ai%2Fdsh/dist-tags")!
 private let harnessProjectURL = URL(string: "https://github.com/deepseek-ai/deepseek-harness")!
 private let maximumProbeAttempts = 180
+
+private struct SemanticVersion: Comparable {
+    private enum PrereleaseIdentifier: Equatable {
+        case numeric(Int)
+        case text(String)
+    }
+
+    let major: Int
+    let minor: Int
+    let patch: Int
+    private let prerelease: [PrereleaseIdentifier]
+
+    init?(_ rawValue: String) {
+        let pattern = #"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"#
+        guard rawValue.range(of: pattern, options: .regularExpression) != nil else { return nil }
+
+        let withoutBuildMetadata = rawValue.split(separator: "+", maxSplits: 1, omittingEmptySubsequences: false)[0]
+        let releaseAndPrerelease = withoutBuildMetadata.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        let releaseParts = releaseAndPrerelease[0].split(separator: ".", omittingEmptySubsequences: false)
+        guard releaseParts.count == 3,
+              let major = Int(releaseParts[0]),
+              let minor = Int(releaseParts[1]),
+              let patch = Int(releaseParts[2]) else { return nil }
+
+        self.major = major
+        self.minor = minor
+        self.patch = patch
+        if releaseAndPrerelease.count == 2 {
+            prerelease = releaseAndPrerelease[1].split(separator: ".").map { component in
+                if let numericValue = Int(component) {
+                    return .numeric(numericValue)
+                }
+                return .text(String(component))
+            }
+        } else {
+            prerelease = []
+        }
+    }
+
+    static func < (lhs: SemanticVersion, rhs: SemanticVersion) -> Bool {
+        if lhs.major != rhs.major { return lhs.major < rhs.major }
+        if lhs.minor != rhs.minor { return lhs.minor < rhs.minor }
+        if lhs.patch != rhs.patch { return lhs.patch < rhs.patch }
+
+        if lhs.prerelease.isEmpty { return false }
+        if rhs.prerelease.isEmpty { return true }
+
+        for index in 0..<Swift.min(lhs.prerelease.count, rhs.prerelease.count) {
+            let left = lhs.prerelease[index]
+            let right = rhs.prerelease[index]
+            if left == right { continue }
+
+            switch (left, right) {
+            case let (.numeric(leftValue), .numeric(rightValue)):
+                return leftValue < rightValue
+            case (.numeric, .text):
+                return true
+            case (.text, .numeric):
+                return false
+            case let (.text(leftValue), .text(rightValue)):
+                return leftValue < rightValue
+            }
+        }
+
+        return lhs.prerelease.count < rhs.prerelease.count
+    }
+}
+
+private func newestOfficialHarnessVersion(in distTags: [String: String]) -> String? {
+    let candidates = [distTags["latest"], distTags["next"]]
+        .compactMap { $0 }
+        .compactMap { rawValue -> (String, SemanticVersion)? in
+            guard let version = SemanticVersion(rawValue) else { return nil }
+            return (rawValue, version)
+        }
+
+    return candidates.max { $0.1 < $1.1 }?.0
+}
+
+private enum HarnessUpdateError: LocalizedError {
+    case invalidResponse
+    case httpStatus(Int)
+    case invalidMetadata
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidResponse:
+            return "npm 官方服务返回了无法识别的响应。"
+        case let .httpStatus(statusCode):
+            return "npm 官方服务返回 HTTP \(statusCode)。"
+        case .invalidMetadata:
+            return "npm 官方版本信息中没有可验证的 latest 或 next 版本。"
+        }
+    }
+}
 
 private struct NodeRuntime {
     let nodeURL: URL
@@ -15,7 +112,7 @@ private struct NodeRuntime {
     let version: String
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate, NSMenuItemValidation {
     private var window: NSWindow!
     private var webView: WKWebView!
     private var startupView: NSView!
@@ -24,6 +121,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var progressIndicator: NSProgressIndicator!
     private var retryButton: NSButton!
     private var logButton: NSButton!
+    private var harnessVersionMenuItem: NSMenuItem!
+    private var checkHarnessUpdateMenuItem: NSMenuItem!
+    private var restoreBundledHarnessMenuItem: NSMenuItem!
 
     private var probeTimer: Timer?
     private var probeAttempts = 0
@@ -31,16 +131,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var harnessProcess: Process?
     private var harnessLogHandle: FileHandle?
     private var harnessWasStartedByThisApp = false
+    private var restartHarnessAfterTermination = false
     private var isTerminating = false
     private var harnessPageHasLoaded = false
+    private var isCheckingForHarnessUpdate = false
     private let workspaceDefaultsKey = "HarnessWorkspacePath"
     private let packageApprovalDefaultsKey = "ApprovedOfficialHarnessPackageDownload"
+    private let harnessVersionDefaultsKey = "SelectedOfficialHarnessPackageVersion"
     private let pageZoomDefaultsKey = "HarnessPageZoom"
     private let minimumPageZoom: CGFloat = 0.75
     private let maximumPageZoom: CGFloat = 2.0
     private let pageZoomStep: CGFloat = 0.1
     private var currentPageZoom: CGFloat = 1.0
     private lazy var workspaceURL: URL = resolveWorkspaceURL()
+    private lazy var selectedHarnessPackageVersion: String = resolveSelectedHarnessPackageVersion()
+    private var harnessPackageSpecifier: String {
+        "\(harnessPackageName)@\(selectedHarnessPackageVersion)"
+    }
 
     private lazy var probeSession: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
@@ -55,6 +162,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         configuration.httpAdditionalHeaders = [
             "Cache-Control": "no-cache, no-store, max-age=0",
             "Pragma": "no-cache"
+        ]
+        return URLSession(configuration: configuration)
+    }()
+
+    private lazy var updateSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.urlCache = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.waitsForConnectivity = false
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 20
+        configuration.httpAdditionalHeaders = [
+            "Accept": "application/json",
+            "Cache-Control": "no-cache, no-store, max-age=0"
         ]
         return URLSession(configuration: configuration)
     }()
@@ -82,15 +205,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         probeTimer?.invalidate()
         probeTimer = nil
         probeSession.invalidateAndCancel()
+        updateSession.invalidateAndCancel()
 
         if harnessWasStartedByThisApp, let process = harnessProcess, process.isRunning {
             appendLog("Stopping Harness because the native app is quitting.\n")
             process.terminate()
         }
 
-        try? harnessLogHandle?.synchronize()
-        try? harnessLogHandle?.close()
-        harnessLogHandle = nil
+        closeHarnessLogHandle()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -250,6 +372,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let revealWorkspaceItem = NSMenuItem(title: "在访达中显示工作区", action: #selector(revealWorkspace(_:)), keyEquivalent: "")
         revealWorkspaceItem.target = self
         appMenu.addItem(revealWorkspaceItem)
+        appMenu.addItem(.separator())
+        harnessVersionMenuItem = NSMenuItem(title: "Harness 内核：\(selectedHarnessPackageVersion)", action: nil, keyEquivalent: "")
+        harnessVersionMenuItem.isEnabled = false
+        appMenu.addItem(harnessVersionMenuItem)
+        checkHarnessUpdateMenuItem = NSMenuItem(title: "检查并更新 Harness 内核…", action: #selector(checkForHarnessUpdate(_:)), keyEquivalent: "")
+        checkHarnessUpdateMenuItem.target = self
+        appMenu.addItem(checkHarnessUpdateMenuItem)
+        restoreBundledHarnessMenuItem = NSMenuItem(
+            title: "恢复内置内核 \(bundledHarnessPackageVersion)",
+            action: #selector(restoreBundledHarnessVersion(_:)),
+            keyEquivalent: ""
+        )
+        restoreBundledHarnessMenuItem.target = self
+        appMenu.addItem(restoreBundledHarnessMenuItem)
+        appMenu.addItem(.separator())
         let projectItem = NSMenuItem(title: "打开 Harness 官方项目", action: #selector(openHarnessProject(_:)), keyEquivalent: "")
         projectItem.target = self
         appMenu.addItem(projectItem)
@@ -310,6 +447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         NSApp.windowsMenu = windowMenu
 
         NSApp.mainMenu = mainMenu
+        refreshHarnessVersionMenuItems()
     }
 
     @objc private func showAbout(_ sender: Any?) {
@@ -317,7 +455,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: appDisplayName,
             .applicationVersion: version,
-            .version: "非官方原生窗口版 · Harness \(harnessPackageVersion)",
+            .version: "非官方原生窗口版 · Harness \(selectedHarnessPackageVersion)",
             .credits: NSAttributedString(
                 string: "独立制作的非官方 macOS 启动器，与 DeepSeek 无隶属、赞助或官方背书关系。\n仅连接本机 127.0.0.1:3080；图标为原创，并非 DeepSeek 官方 Logo。"
             )
@@ -358,6 +496,192 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
     @objc private func openHarnessProject(_ sender: Any?) {
         NSWorkspace.shared.open(harnessProjectURL)
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem === checkHarnessUpdateMenuItem {
+            return !isCheckingForHarnessUpdate
+        }
+        if menuItem === restoreBundledHarnessMenuItem {
+            return !isCheckingForHarnessUpdate && selectedHarnessPackageVersion != bundledHarnessPackageVersion
+        }
+        return true
+    }
+
+    private func refreshHarnessVersionMenuItems() {
+        harnessVersionMenuItem?.title = "Harness 内核：\(selectedHarnessPackageVersion)"
+        checkHarnessUpdateMenuItem?.title = isCheckingForHarnessUpdate
+            ? "正在检查官方更新…"
+            : "检查并更新 Harness 内核…"
+        restoreBundledHarnessMenuItem?.title = "恢复内置内核 \(bundledHarnessPackageVersion)"
+        restoreBundledHarnessMenuItem?.isEnabled = selectedHarnessPackageVersion != bundledHarnessPackageVersion
+        NSApp.mainMenu?.update()
+    }
+
+    @objc private func checkForHarnessUpdate(_ sender: Any?) {
+        guard !isCheckingForHarnessUpdate else { return }
+        isCheckingForHarnessUpdate = true
+        refreshHarnessVersionMenuItems()
+
+        var request = URLRequest(url: harnessDistTagsURL)
+        request.httpMethod = "GET"
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.timeoutInterval = 15
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("DeepSeek-Harness-macOS-Launcher", forHTTPHeaderField: "User-Agent")
+
+        updateSession.dataTask(with: request) { [weak self] data, response, error in
+            let result: Result<[String: String], Error>
+            if let error {
+                result = .failure(error)
+            } else if let httpResponse = response as? HTTPURLResponse,
+                      !(200...299).contains(httpResponse.statusCode) {
+                result = .failure(HarnessUpdateError.httpStatus(httpResponse.statusCode))
+            } else if response as? HTTPURLResponse == nil {
+                result = .failure(HarnessUpdateError.invalidResponse)
+            } else if let data,
+                      let distTags = try? JSONDecoder().decode([String: String].self, from: data) {
+                result = .success(distTags)
+            } else {
+                result = .failure(HarnessUpdateError.invalidMetadata)
+            }
+
+            DispatchQueue.main.async {
+                self?.finishHarnessUpdateCheck(result)
+            }
+        }.resume()
+    }
+
+    private func finishHarnessUpdateCheck(_ result: Result<[String: String], Error>) {
+        isCheckingForHarnessUpdate = false
+        refreshHarnessVersionMenuItems()
+
+        switch result {
+        case let .failure(error):
+            presentAlert(
+                title: "无法检查 Harness 更新",
+                detail: "没有更改当前内核。\n\n\(error.localizedDescription)",
+                style: .warning
+            )
+        case let .success(distTags):
+            guard let newestVersion = newestOfficialHarnessVersion(in: distTags),
+                  let newestSemanticVersion = SemanticVersion(newestVersion),
+                  let selectedSemanticVersion = SemanticVersion(selectedHarnessPackageVersion) else {
+                presentAlert(
+                    title: "无法识别官方版本",
+                    detail: HarnessUpdateError.invalidMetadata.localizedDescription,
+                    style: .warning
+                )
+                return
+            }
+
+            guard selectedSemanticVersion < newestSemanticVersion else {
+                presentAlert(
+                    title: "Harness 内核已是最新",
+                    detail: "当前选择：\(selectedHarnessPackageVersion)\n官方最新：\(newestVersion)",
+                    style: .informational
+                )
+                return
+            }
+
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = "发现官方 Harness 内核更新"
+            alert.informativeText = "当前：\(selectedHarnessPackageVersion)\n新版：\(newestVersion)\n\n继续后将从 npm 官方注册表获取新版。Harness 仍处于 Developer Preview，新版可能包含不兼容变化；你可以随时从 App 菜单恢复内置版本 \(bundledHarnessPackageVersion)。"
+            alert.addButton(withTitle: "更新并重启")
+            alert.addButton(withTitle: "取消")
+            alert.beginSheetModal(for: window) { [weak self] response in
+                guard response == .alertFirstButtonReturn else { return }
+                self?.selectHarnessPackageVersion(newestVersion)
+            }
+        }
+    }
+
+    @objc private func restoreBundledHarnessVersion(_ sender: Any?) {
+        guard selectedHarnessPackageVersion != bundledHarnessPackageVersion else { return }
+
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "恢复内置 Harness 内核？"
+        alert.informativeText = "当前：\(selectedHarnessPackageVersion)\n恢复为：\(bundledHarnessPackageVersion)"
+        alert.addButton(withTitle: "恢复并重启")
+        alert.addButton(withTitle: "取消")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.selectHarnessPackageVersion(bundledHarnessPackageVersion)
+        }
+    }
+
+    private func selectHarnessPackageVersion(_ version: String) {
+        guard SemanticVersion(version) != nil else {
+            presentAlert(title: "版本无效", detail: "没有更改当前 Harness 内核。", style: .warning)
+            return
+        }
+
+        selectedHarnessPackageVersion = version
+        UserDefaults.standard.set(version, forKey: harnessVersionDefaultsKey)
+        UserDefaults.standard.set(true, forKey: packageApprovalDefaultsKey)
+        refreshHarnessVersionMenuItems()
+        restartHarnessForSelectedVersion()
+    }
+
+    private func restartHarnessForSelectedVersion() {
+        probeTimer?.invalidate()
+        probeTimer = nil
+        probeAttempts = 0
+
+        if harnessWasStartedByThisApp, let process = harnessProcess, process.isRunning {
+            restartHarnessAfterTermination = true
+            harnessPageHasLoaded = false
+            webView.stopLoading()
+            showStartup(
+                status: "正在切换 Harness 内核",
+                detail: "已选择 \(harnessPackageSpecifier)，正在重启本机服务…",
+                isError: false
+            )
+            appendLog("Switching Harness package to \(harnessPackageSpecifier).\n")
+            process.terminate()
+            return
+        }
+
+        probeHarness { [weak self] isReady in
+            guard let self else { return }
+            if isReady {
+                self.presentAlert(
+                    title: "新版内核已选择",
+                    detail: "下次由此 App 启动 Harness 时，将使用 \(self.harnessPackageSpecifier)。\n\n当前 127.0.0.1:3080 服务不是由此 App 启动，因此没有擅自终止它。",
+                    style: .informational
+                )
+            } else {
+                self.harnessPageHasLoaded = false
+                self.webView.stopLoading()
+                self.showStartup(
+                    status: "正在启动更新后的 Harness",
+                    detail: "正在运行 \(self.harnessPackageSpecifier)…",
+                    isError: false
+                )
+                self.startHarnessProcess()
+            }
+        }
+    }
+
+    private func resolveSelectedHarnessPackageVersion() -> String {
+        guard let bundledVersion = SemanticVersion(bundledHarnessPackageVersion),
+              let storedValue = UserDefaults.standard.string(forKey: harnessVersionDefaultsKey),
+              let storedVersion = SemanticVersion(storedValue),
+              bundledVersion <= storedVersion else {
+            return bundledHarnessPackageVersion
+        }
+        return storedValue
+    }
+
+    private func presentAlert(title: String, detail: String, style: NSAlert.Style) {
+        let alert = NSAlert()
+        alert.alertStyle = style
+        alert.messageText = title
+        alert.informativeText = detail
+        alert.addButton(withTitle: "好")
+        alert.beginSheetModal(for: window)
     }
 
     @objc private func reloadPage(_ sender: Any?) {
@@ -478,6 +802,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             process.terminationHandler = { [weak self] terminatedProcess in
                 DispatchQueue.main.async {
                     guard let self, !self.isTerminating else { return }
+                    self.harnessProcess = nil
+                    self.harnessWasStartedByThisApp = false
+                    self.closeHarnessLogHandle()
+
+                    if self.restartHarnessAfterTermination {
+                        self.restartHarnessAfterTermination = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self] in
+                            self?.startHarnessProcess()
+                        }
+                        return
+                    }
+
                     self.probeHarness { isReady in
                         if isReady {
                             self.loadHarnessPage()
@@ -623,6 +959,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     private func prepareLogFile() throws {
+        closeHarnessLogHandle()
         let directory = logURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         if !FileManager.default.fileExists(atPath: logURL.path) {
@@ -631,6 +968,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let handle = try FileHandle(forWritingTo: logURL)
         try handle.seekToEnd()
         harnessLogHandle = handle
+    }
+
+    private func closeHarnessLogHandle() {
+        try? harnessLogHandle?.synchronize()
+        try? harnessLogHandle?.close()
+        harnessLogHandle = nil
     }
 
     private func appendLog(_ message: String) {
@@ -789,6 +1132,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
         return nil
     }
+}
+
+private func runSelfTests() -> Int32 {
+    var failures: [String] = []
+
+    func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
+        if !condition() {
+            failures.append(message)
+        }
+    }
+
+    expect(SemanticVersion("0.1.0-rc.6") != nil, "accept rc version")
+    expect(SemanticVersion("0.1.0-rc.6;touch-bad") == nil, "reject unsafe package version")
+    expect(SemanticVersion("0.1.0-rc.6")! < SemanticVersion("0.1.0-rc.7")!, "compare rc increments")
+    expect(SemanticVersion("0.1.0-rc.9")! < SemanticVersion("0.1.0-rc.10")!, "compare numeric prerelease identifiers")
+    expect(SemanticVersion("0.1.0-rc.6")! < SemanticVersion("0.1.0")!, "stable version follows prerelease")
+    expect(SemanticVersion("0.1.0")! < SemanticVersion("0.2.0")!, "compare minor versions")
+    expect(
+        newestOfficialHarnessVersion(in: ["latest": "0.1.0-rc.6", "next": "0.1.0-rc.7"]) == "0.1.0-rc.7",
+        "prefer newer official dist-tag"
+    )
+    expect(
+        newestOfficialHarnessVersion(in: ["latest": "0.1.0", "next": "0.1.0-rc.9"]) == "0.1.0",
+        "prefer stable release over its prerelease"
+    )
+    expect(
+        newestOfficialHarnessVersion(in: ["latest": "invalid", "next": "0.1.0-rc.6"]) == "0.1.0-rc.6",
+        "ignore invalid official metadata entries"
+    )
+
+    if failures.isEmpty {
+        print("Self-test passed: semantic versioning and official dist-tag selection")
+        return 0
+    }
+
+    for failure in failures {
+        fputs("Self-test failed: \(failure)\n", stderr)
+    }
+    return 1
+}
+
+if CommandLine.arguments.contains("--self-test") {
+    Darwin.exit(runSelfTests())
 }
 
 let application = NSApplication.shared

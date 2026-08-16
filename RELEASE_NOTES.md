@@ -1,4 +1,27 @@
-# Unofficial macOS Launcher v2.3.1
+# Unofficial macOS Launcher v2.4.0
+
+Native Harness core update release.
+
+## Why this matters
+
+The native macOS launcher no longer has to be repackaged every time DeepSeek publishes a new Harness core. Users can keep the verified launcher window, explicitly check the official npm channel, and move to the newest valid release without manually editing commands. The update remains user-confirmed and reversible because upstream is still a developer preview.
+
+## Added
+
+- Added a native “Check and update Harness core” menu action backed only by the official npm dist-tags endpoint.
+- Automatically selects the higher valid `latest` or `next` semantic version after user confirmation.
+- Persists the selected official package version and uses it for subsequent npx launches.
+- Added a native rollback action for the bundled verified `0.1.0-rc.6` version.
+
+## Safety
+
+- Rejects malformed package versions before constructing the npx package specifier.
+- Restarts only a Harness process launched and owned by this App. An external service on port 3080 is never terminated automatically.
+- Keeps updates user-initiated because upstream remains a developer preview with possible breaking changes.
+
+---
+
+## v2.3.1
 
 Interaction fix release.
 
