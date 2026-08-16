@@ -35,6 +35,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var harnessPageHasLoaded = false
     private let workspaceDefaultsKey = "HarnessWorkspacePath"
     private let packageApprovalDefaultsKey = "ApprovedOfficialHarnessPackageDownload"
+    private let pageZoomDefaultsKey = "HarnessPageZoom"
+    private let minimumPageZoom: CGFloat = 0.75
+    private let maximumPageZoom: CGFloat = 2.0
+    private let pageZoomStep: CGFloat = 0.1
+    private var currentPageZoom: CGFloat = 1.0
     private lazy var workspaceURL: URL = resolveWorkspaceURL()
 
     private lazy var probeSession: URLSession = {
@@ -111,14 +116,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let contentRect = NSRect(x: 0, y: 0, width: 1320, height: 860)
         window = NSWindow(
             contentRect: contentRect,
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = appDisplayName
-        window.titleVisibility = .hidden
-        window.titlebarAppearsTransparent = true
-        window.isMovableByWindowBackground = true
+        window.titleVisibility = .visible
+        window.titlebarAppearsTransparent = false
         window.minSize = NSSize(width: 900, height: 600)
         window.center()
         window.setFrameAutosaveName("DeepSeekHarnessMainWindow")
@@ -139,13 +143,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         webView.translatesAutoresizingMaskIntoConstraints = false
         webView.navigationDelegate = self
         webView.uiDelegate = self
-        webView.allowsMagnification = true
+        webView.allowsMagnification = false
         webView.isHidden = true
         rootView.addSubview(webView)
 
         startupView = makeStartupView()
         startupView.translatesAutoresizingMaskIntoConstraints = false
         rootView.addSubview(startupView)
+
+        currentPageZoom = storedPageZoom()
+        applyPageZoom(currentPageZoom, persist: false)
 
         NSLayoutConstraint.activate([
             webView.leadingAnchor.constraint(equalTo: rootView.leadingAnchor),
@@ -276,7 +283,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let reloadItem = NSMenuItem(title: "重新载入", action: #selector(reloadPage(_:)), keyEquivalent: "r")
         reloadItem.target = self
         viewMenu.addItem(reloadItem)
-        let actualSizeItem = NSMenuItem(title: "实际大小", action: #selector(resetMagnification(_:)), keyEquivalent: "0")
+        viewMenu.addItem(.separator())
+        let increaseSizeItem = NSMenuItem(title: "增大字体", action: #selector(increasePageZoom(_:)), keyEquivalent: "+")
+        increaseSizeItem.keyEquivalentModifierMask = [.command]
+        increaseSizeItem.target = self
+        viewMenu.addItem(increaseSizeItem)
+        let decreaseSizeItem = NSMenuItem(title: "缩小字体", action: #selector(decreasePageZoom(_:)), keyEquivalent: "-")
+        decreaseSizeItem.keyEquivalentModifierMask = [.command]
+        decreaseSizeItem.target = self
+        viewMenu.addItem(decreaseSizeItem)
+        let actualSizeItem = NSMenuItem(title: "实际大小", action: #selector(resetPageZoom(_:)), keyEquivalent: "0")
+        actualSizeItem.keyEquivalentModifierMask = [.command]
         actualSizeItem.target = self
         viewMenu.addItem(actualSizeItem)
         viewMenuItem.submenu = viewMenu
@@ -351,8 +368,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
     }
 
-    @objc private func resetMagnification(_ sender: Any?) {
-        webView.setMagnification(1.0, centeredAt: NSPoint(x: webView.bounds.midX, y: webView.bounds.midY))
+    @objc private func increasePageZoom(_ sender: Any?) {
+        applyPageZoom(currentPageZoom + pageZoomStep)
+    }
+
+    @objc private func decreasePageZoom(_ sender: Any?) {
+        applyPageZoom(currentPageZoom - pageZoomStep)
+    }
+
+    @objc private func resetPageZoom(_ sender: Any?) {
+        applyPageZoom(1.0)
+    }
+
+    private func storedPageZoom() -> CGFloat {
+        guard let storedValue = UserDefaults.standard.object(forKey: pageZoomDefaultsKey) as? NSNumber else {
+            return 1.0
+        }
+        return normalizedPageZoom(CGFloat(storedValue.doubleValue))
+    }
+
+    private func normalizedPageZoom(_ value: CGFloat) -> CGFloat {
+        guard value.isFinite else { return 1.0 }
+        let clamped = Swift.min(Swift.max(value, minimumPageZoom), maximumPageZoom)
+        return (clamped / pageZoomStep).rounded() * pageZoomStep
+    }
+
+    private func applyPageZoom(_ requestedZoom: CGFloat, persist: Bool = true) {
+        currentPageZoom = normalizedPageZoom(requestedZoom)
+        webView.pageZoom = currentPageZoom
+        statusLabel?.font = NSFont.systemFont(ofSize: 25 * currentPageZoom, weight: .semibold)
+        detailLabel?.font = NSFont.systemFont(ofSize: 14 * currentPageZoom, weight: .regular)
+
+        if persist {
+            UserDefaults.standard.set(Double(currentPageZoom), forKey: pageZoomDefaultsKey)
+        }
     }
 
     @objc private func retryConnection(_ sender: Any?) {

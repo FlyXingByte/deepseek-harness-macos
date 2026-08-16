@@ -4,7 +4,7 @@
 <p align="center">非官方启动器 · 独立窗口 · 本机工作区</p>
 
 <p align="center">
-  <a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.3/DeepSeek-Harness-v2.3-macOS-arm64.dmg"><strong>↓ 下载 v2.3</strong></a>
+  <a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.3.1/DeepSeek-Harness-v2.3.1-macOS-arm64.dmg"><strong>↓ 下载 v2.3.1</strong></a>
 </p>
 <p align="center">
   <a href="./INSTALL.md">安装说明</a>
@@ -14,7 +14,7 @@
 <p align="center">Apple Silicon · macOS 12+ · Node.js 22.19–22.x 或 24.0+（不支持 23.x）</p>
 
 > [!WARNING]
-> **v2.3 尚未公证。** 首次打开：在访达中右键 App → **打开** → 再确认；不要关闭 Gatekeeper。
+> **v2.3.1 尚未公证。** 首次打开：在访达中右键 App → **打开** → 再确认；不要关闭 Gatekeeper。
 
 <p align="center">
   <picture>
@@ -29,12 +29,13 @@
 这是一个轻量的原生 macOS 启动器。它负责启动固定版本的官方 DeepSeek Harness Web UI，并把工作台显示在独立窗口中。
 
 - **从程序坞打开**：独立窗口、菜单栏和 App 图标。
+- **原生窗口交互**：拖动标准标题栏移动窗口；`Command +` / `Command -` 调整字体，`Command 0` 恢复默认大小。
 - **服务留在本机**：Harness Web UI 仅监听 `127.0.0.1:3080`。
 - **工作区由你选择**：使用隔离的默认目录，或切换到自己的项目文件夹。
 
 ## 三步安装
 
-1. [下载 v2.3 DMG](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.3/DeepSeek-Harness-v2.3-macOS-arm64.dmg)，打开后把 **DeepSeek Harness.app** 拖入 **Applications**。
+1. [下载 v2.3.1 DMG](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.3.1/DeepSeek-Harness-v2.3.1-macOS-arm64.dmg)，打开后把 **DeepSeek Harness.app** 拖入 **Applications**。
 2. 在“应用程序”中右键 App，选择 **打开**，然后在 macOS 提示中再次确认。
 3. 首次启动时确认通过 `npx` 获取固定版本的官方 `@deepseek-ai/dsh@0.1.0-rc.6`，等待工作台出现。
 
@@ -120,11 +121,11 @@
 <details>
 <summary><strong>验证下载文件与本地构建</strong></summary>
 
-下载 [SHA-256 文件](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.3/DeepSeek-Harness-v2.3-macOS-arm64.dmg.sha256) 后，在终端运行：
+下载 [SHA-256 文件](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.3.1/DeepSeek-Harness-v2.3.1-macOS-arm64.dmg.sha256) 后，在终端运行：
 
 ```sh
 cd ~/Downloads
-shasum -a 256 -c DeepSeek-Harness-v2.3-macOS-arm64.dmg.sha256
+shasum -a 256 -c DeepSeek-Harness-v2.3.1-macOS-arm64.dmg.sha256
 ```
 
 本地构建与验证：
@@ -141,4 +142,4 @@ shasum -a 256 -c DeepSeek-Harness-v2.3-macOS-arm64.dmg.sha256
 
 ---
 
-<p align="center"><sub><a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/tag/v2.3">v2.3</a> · DSH 0.1.0-rc.6 · arm64 · <a href="./LICENSE">MIT</a> · <a href="./NOTICE.md">NOTICE</a> · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/issues">Issues</a></sub></p>
+<p align="center"><sub><a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/tag/v2.3.1">v2.3.1</a> · DSH 0.1.0-rc.6 · arm64 · <a href="./LICENSE">MIT</a> · <a href="./NOTICE.md">NOTICE</a> · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/issues">Issues</a></sub></p>
