@@ -26,10 +26,11 @@
 
 ## 一个窗口。不是一个浏览器标签。
 
-这是一个轻量的原生 macOS 启动器。它负责启动固定版本的官方 DeepSeek Harness Web UI，并把工作台显示在独立窗口中。
+这是一个轻量的原生 macOS 启动器。它默认启动经过验证的官方 DeepSeek Harness 版本，也可以在你确认后选择 npm 官方发布的新版，并把工作台显示在独立窗口中。
 
 - **从程序坞打开**：独立窗口、菜单栏和 App 图标。
 - **原生窗口交互**：拖动标准标题栏移动窗口；`Command +` / `Command -` 调整字体，`Command 0` 恢复默认大小。
+- **一键检查内核更新**：从 App 菜单读取 npm 官方 `latest` / `next`，自动选择更高版本，并保留内置版本作为回退。
 - **服务留在本机**：Harness Web UI 仅监听 `127.0.0.1:3080`。
 - **工作区由你选择**：使用隔离的默认目录，或切换到自己的项目文件夹。
 
@@ -37,7 +38,7 @@
 
 1. [下载 v2.3.1 DMG](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.3.1/DeepSeek-Harness-v2.3.1-macOS-arm64.dmg)，打开后把 **DeepSeek Harness.app** 拖入 **Applications**。
 2. 在“应用程序”中右键 App，选择 **打开**，然后在 macOS 提示中再次确认。
-3. 首次启动时确认通过 `npx` 获取固定版本的官方 `@deepseek-ai/dsh@0.1.0-rc.6`，等待工作台出现。
+3. 首次启动时确认通过 `npx` 获取默认版本的官方 `@deepseek-ai/dsh@0.1.0-rc.6`，等待工作台出现。
 
 首次获取需要联网。请先从 [Node.js 官网](https://nodejs.org/en/download) 安装 Node.js；Harness 与 Node.js 均不包含在 DMG 中。
 
@@ -72,7 +73,7 @@
 - **Node.js**：由用户安装，用于运行 `npx` 与 Harness。
 
 > [!NOTE]
-> DeepSeek Harness 仍处于 **Developer Preview**，可能出现破坏兼容性的变化。本启动器明确请求顶层包 `@deepseek-ai/dsh@0.1.0-rc.6`；其依赖由 npm 按官方包声明解析。
+> DeepSeek Harness 仍处于 **Developer Preview**，可能出现破坏兼容性的变化。本启动器内置默认版本 `@deepseek-ai/dsh@0.1.0-rc.6`；只有你主动选择“检查并更新 Harness 内核…”并确认后，才会切换到 npm 官方 `latest` / `next` 中更高的版本。内置版本始终可从菜单恢复。
 
 这是 FlyX 独立制作的非官方启动器，与 DeepSeek 或 Apple Inc. 无隶属、赞助或背书关系。名称仅用于说明兼容性；鲸鱼图标与主视觉不是官方素材。
 
@@ -115,6 +116,8 @@
 **提示找不到 Node.js 或 npx？** 从 [Node.js 官网](https://nodejs.org/en/download) 安装 Node.js 22.19–22.x 或 24.0+（不支持 23.x），然后重新打开 App。
 
 **输入框不可用？** 先在 **Settings → Models** 配置并选择模型，再点击 **Choose workspace** 选择工作区。
+
+**怎样更新 Harness 内核？** 打开菜单栏中的 **DeepSeek Harness → 检查并更新 Harness 内核…**。若官方存在更高版本，启动器会自动选中并请求确认；若当前 3080 服务由其他终端启动，只保存选择，不会擅自终止外部进程。
 
 </details>
 
