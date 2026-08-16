@@ -34,6 +34,27 @@
 - **服务留在本机**：Harness Web UI 仅监听 `127.0.0.1:3080`。
 - **工作区由你选择**：使用隔离的默认目录，或切换到自己的项目文件夹。
 
+## v2.4.0 重点更新：Harness 内核可以自己跟进官方版本
+
+以前，启动器和 Harness 内核版本绑定在一起：即使 DeepSeek 官方已经发布新内核，也要等启动器重新打包。v2.4.0 把这两件事拆开了——macOS App 继续提供稳定的原生窗口，Harness 内核则可以由你主动检查并切换。
+
+打开 macOS 屏幕顶部的 **DeepSeek Harness** 菜单，你会看到：
+
+- **Harness 内核：0.1.0-rc.6**：显示当前选择的内核版本。
+- **检查并更新 Harness 内核…**：一键读取 npm 官方 `latest` 与 `next`，通过 SemVer 自动选择更高版本。
+- **恢复内置内核 0.1.0-rc.6**：新版出现兼容问题时，可以直接回退到随 App 验证过的默认版本。
+
+更新过程保留了一道人为确认：发现新版后，App 会先显示当前版本和目标版本，只有点击 **更新并重启** 才会切换。这不是后台静默升级，因为 Harness 仍处于 Developer Preview，新版本可能包含破坏兼容性的变化。
+
+安全边界也没有扩大：
+
+- 更新信息只来自固定的 npm 官方 dist-tags 地址，异常或不合法的版本号会被拒绝。
+- App 只重启由它自己启动的 Harness 进程；如果 `127.0.0.1:3080` 是其他终端启动的服务，只保存新版选择，不会擅自结束外部进程。
+- 更新只改变以后由 `npx` 获取的官方 `@deepseek-ai/dsh` 版本，不读取、迁移或修改 Harness 的 API Key、会话与工作区数据。
+
+> [!IMPORTANT]
+> v2.4.0 源码已进入发布准备流程；页面顶部的公开 DMG 下载在正式创建 v2.4.0 Release 前仍指向 v2.3.1。
+
 ## 三步安装
 
 1. [下载 v2.3.1 DMG](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.3.1/DeepSeek-Harness-v2.3.1-macOS-arm64.dmg)，打开后把 **DeepSeek Harness.app** 拖入 **Applications**。

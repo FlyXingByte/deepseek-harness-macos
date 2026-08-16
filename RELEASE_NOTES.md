@@ -2,6 +2,10 @@
 
 Native Harness core update release.
 
+## Why this matters
+
+The native macOS launcher no longer has to be repackaged every time DeepSeek publishes a new Harness core. Users can keep the verified launcher window, explicitly check the official npm channel, and move to the newest valid release without manually editing commands. The update remains user-confirmed and reversible because upstream is still a developer preview.
+
 ## Added
 
 - Added a native “Check and update Harness core” menu action backed only by the official npm dist-tags endpoint.
