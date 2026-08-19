@@ -4,7 +4,7 @@
 <p align="center">非官方启动器 · 独立窗口 · 本机工作区</p>
 
 <p align="center">
-  <a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.3.1/DeepSeek-Harness-v2.3.1-macOS-arm64.dmg"><strong>↓ 下载 v2.3.1</strong></a>
+  <a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.5.0/DeepSeek-Harness-v2.5.0-macOS-arm64.dmg"><strong>↓ 下载 v2.5.0</strong></a>
 </p>
 <p align="center">
   <a href="./INSTALL.md">安装说明</a>
@@ -14,7 +14,7 @@
 <p align="center">Apple Silicon · macOS 12+ · Node.js 22.19–22.x 或 24.0+（不支持 23.x）</p>
 
 > [!WARNING]
-> **v2.3.1 尚未公证。** 首次打开：在访达中右键 App → **打开** → 再确认；不要关闭 Gatekeeper。
+> **v2.5.0 尚未公证。** 首次打开：在访达中右键 App → **打开** → 再确认；不要关闭 Gatekeeper。
 
 <p align="center">
   <picture>
@@ -29,10 +29,21 @@
 这是一个轻量的原生 macOS 启动器。它默认启动经过验证的官方 DeepSeek Harness 版本，也可以在你确认后选择 npm 官方发布的新版，并把工作台显示在独立窗口中。
 
 - **从程序坞打开**：独立窗口、菜单栏和 App 图标。
-- **原生窗口交互**：拖动标准标题栏移动窗口；`Command +` / `Command -` 调整字体，`Command 0` 恢复默认大小。
+- **原生窗口交互**：拖动标题栏移动窗口；`Command +` / `Command -` 调整字体，`Command 0` 恢复默认大小。
+- **没有浏览器痕迹**：标题栏与工作台背景融为一体并跟随明暗主题；右键只保留原生编辑命令，控件不再出现网页手型光标与文字选中，整页橡皮筋回弹和网页滚动条也一并去掉。
 - **一键检查内核更新**：从 App 菜单读取 npm 官方 `latest` / `next`，自动选择更高版本，并保留内置版本作为回退。
 - **服务留在本机**：Harness Web UI 仅监听 `127.0.0.1:3080`。
 - **工作区由你选择**：使用隔离的默认目录，或切换到自己的项目文件夹。
+
+## v2.5.0 重点更新：像 App 一样打开，不再弹出 Safari
+
+Harness 的工作台本质仍由官方 Web UI 提供，macOS 启动器继续使用 `WKWebView` 承载它。v2.5.0 改进的是呈现和启动方式：保留 Web UI 的完整能力，同时去掉会让独立窗口看起来像浏览器标签页的交互痕迹。
+
+- 标准 macOS 标题栏与工作台背景融为一体，并跟随页面的明暗主题。
+- 控件使用普通箭头光标，导航与按钮文字不再被误选；输入框和编辑区仍保留文本光标与原生复制粘贴。
+- 右键菜单只保留剪切、复制、粘贴、撤销、重做等编辑命令，不再显示重新载入、后退、前进或检查元素。
+- 关闭整页橡皮筋回弹、链接预览和资源拖拽，并让滚动条更接近 macOS 的轻量样式。
+- 启动官方 Harness 时加入 `--no-open`，因此从程序坞打开 App 不会再自动弹出同一个 `127.0.0.1:3080` Safari 页面；真正的外部链接仍交给默认浏览器。
 
 ## v2.4.0 重点更新：Harness 内核可以自己跟进官方版本
 
@@ -52,12 +63,9 @@
 - App 只重启由它自己启动的 Harness 进程；如果 `127.0.0.1:3080` 是其他终端启动的服务，只保存新版选择，不会擅自结束外部进程。
 - 更新只改变以后由 `npx` 获取的官方 `@deepseek-ai/dsh` 版本，不读取、迁移或修改 Harness 的 API Key、会话与工作区数据。
 
-> [!IMPORTANT]
-> v2.4.0 源码已进入发布准备流程；页面顶部的公开 DMG 下载在正式创建 v2.4.0 Release 前仍指向 v2.3.1。
-
 ## 三步安装
 
-1. [下载 v2.3.1 DMG](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.3.1/DeepSeek-Harness-v2.3.1-macOS-arm64.dmg)，打开后把 **DeepSeek Harness.app** 拖入 **Applications**。
+1. [下载 v2.5.0 DMG](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.5.0/DeepSeek-Harness-v2.5.0-macOS-arm64.dmg)，打开后把 **DeepSeek Harness.app** 拖入 **Applications**。
 2. 在“应用程序”中右键 App，选择 **打开**，然后在 macOS 提示中再次确认。
 3. 首次启动时确认通过 `npx` 获取默认版本的官方 `@deepseek-ai/dsh@0.1.0-rc.6`，等待工作台出现。
 
@@ -145,11 +153,11 @@
 <details>
 <summary><strong>验证下载文件与本地构建</strong></summary>
 
-下载 [SHA-256 文件](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.3.1/DeepSeek-Harness-v2.3.1-macOS-arm64.dmg.sha256) 后，在终端运行：
+下载 [SHA-256 文件](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.5.0/DeepSeek-Harness-v2.5.0-macOS-arm64.dmg.sha256) 后，在终端运行：
 
 ```sh
 cd ~/Downloads
-shasum -a 256 -c DeepSeek-Harness-v2.3.1-macOS-arm64.dmg.sha256
+shasum -a 256 -c DeepSeek-Harness-v2.5.0-macOS-arm64.dmg.sha256
 ```
 
 本地构建与验证：
@@ -166,4 +174,4 @@ shasum -a 256 -c DeepSeek-Harness-v2.3.1-macOS-arm64.dmg.sha256
 
 ---
 
-<p align="center"><sub><a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/tag/v2.3.1">v2.3.1</a> · DSH 0.1.0-rc.6 · arm64 · <a href="./LICENSE">MIT</a> · <a href="./NOTICE.md">NOTICE</a> · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/issues">Issues</a></sub></p>
+<p align="center"><sub><a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/tag/v2.5.0">v2.5.0</a> · DSH 0.1.0-rc.6 · arm64 · <a href="./LICENSE">MIT</a> · <a href="./NOTICE.md">NOTICE</a> · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/issues">Issues</a></sub></p>

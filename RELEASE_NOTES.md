@@ -1,4 +1,31 @@
-# Unofficial macOS Launcher v2.4.0
+# Unofficial macOS Launcher v2.5.0
+
+Native presentation and browser-launch fix release.
+
+## Highlights
+
+- Blends the standard macOS title bar into the Harness workspace and follows the page's light or dark appearance.
+- Removes common browser tells from the embedded workspace: link previews, hand cursors, draggable page assets, whole-page rubber-band scrolling, WebKit-style context actions, and selectable navigation chrome.
+- Keeps text editing native by preserving cut, copy, paste, undo, redo, delete, and select-all commands where they apply.
+
+## Fixed
+
+- Starts the official Harness Web UI with `--no-open`, so launching the native App no longer opens the same localhost workspace in Safari or another default browser.
+- Keeps external HTTP and HTTPS links opening in the default browser while the local Harness workspace remains inside the App.
+
+## Safety and compatibility
+
+- The service remains bound to `127.0.0.1:3080`; this release does not expose Harness to the LAN.
+- Model credentials, Harness sessions, workspaces, and the user-selected official core version are not migrated or copied by the launcher.
+- The bundled rollback target remains the previously verified `@deepseek-ai/dsh@0.1.0-rc.6`.
+
+## Distribution status
+
+This build is distributed as an ad-hoc signed, non-notarized prerelease. On first launch, use Finder → right-click → Open; do not disable Gatekeeper.
+
+---
+
+## v2.4.0
 
 Native Harness core update release.
 

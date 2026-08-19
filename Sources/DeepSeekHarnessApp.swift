@@ -10,6 +10,160 @@ private let bundledHarnessPackageVersion = "0.1.0-rc.6"
 private let harnessDistTagsURL = URL(string: "https://registry.npmjs.org/-/package/%40deepseek-ai%2Fdsh/dist-tags")!
 private let harnessProjectURL = URL(string: "https://github.com/deepseek-ai/deepseek-harness")!
 private let maximumProbeAttempts = 180
+private let nativeChromeMessageName = "harnessNativeChrome"
+private let defaultChromeColor = NSColor(srgbRed: 0.018, green: 0.043, blue: 0.115, alpha: 1)
+
+/// Injected before the page runs: removes the browser tells the Harness Web UI inherits
+/// from running inside WebKit (hand cursors on controls, selectable chrome labels,
+/// draggable links and images, rubber-band overscroll, web-styled scrollbars).
+private let nativeChromeStyleScript = """
+(function () {
+    const id = 'harness-native-chrome-style';
+    if (document.getElementById(id)) { return; }
+    const style = document.createElement('style');
+    style.id = id;
+    style.textContent = [
+        'html, body { overscroll-behavior: none; -webkit-font-smoothing: antialiased; }',
+        'button, [role="button"], [role="tab"], [role="menuitem"], [role="option"], [role="switch"], [role="radio"], [role="checkbox"], [data-slot="button"], summary, label, select, a[href], .cursor-pointer { cursor: default !important; }',
+        'input, textarea, [contenteditable="true"], [contenteditable=""] { cursor: text !important; }',
+        'button, [role="button"], [role="tab"], [role="menuitem"], [data-slot="button"], nav, label, summary, select, svg { -webkit-user-select: none !important; user-select: none !important; }',
+        'input, textarea, [contenteditable="true"], [contenteditable=""] { -webkit-user-select: text !important; user-select: text !important; }',
+        'a[href], img, svg, video, canvas { -webkit-user-drag: none !important; }',
+        '::-webkit-scrollbar { width: 11px; height: 11px; background: transparent; }',
+        '::-webkit-scrollbar-track { background: transparent; }',
+        '::-webkit-scrollbar-thumb { background-color: rgba(142, 142, 147, 0.42); background-clip: content-box; border: 3px solid transparent; border-radius: 8px; }',
+        '::-webkit-scrollbar-thumb:hover { background-color: rgba(142, 142, 147, 0.66); }',
+        '::-webkit-scrollbar-corner { background: transparent; }'
+    ].join('\\n');
+    (document.head || document.documentElement).appendChild(style);
+    document.addEventListener('DOMContentLoaded', function () {
+        if (document.head && style.parentNode !== document.head) { document.head.appendChild(style); }
+    }, { once: true });
+})();
+"""
+
+/// Reports the page background to the native side so the title bar, window background and
+/// system appearance stay one continuous surface with the Harness UI instead of framing it.
+private let nativeChromeThemeScript = """
+(function () {
+    const bridge = window.webkit
+        && window.webkit.messageHandlers
+        && window.webkit.messageHandlers.harnessNativeChrome;
+    if (!bridge) { return; }
+
+    let lastReported = '';
+
+    function measure(value) {
+        if (!value) { return null; }
+        const canvas = document.createElement('canvas');
+        canvas.width = 1;
+        canvas.height = 1;
+        const context = canvas.getContext('2d');
+        if (!context) { return null; }
+        context.clearRect(0, 0, 1, 1);
+        try {
+            context.fillStyle = value;
+        } catch (error) {
+            return null;
+        }
+        context.fillRect(0, 0, 1, 1);
+        let pixel;
+        try {
+            pixel = context.getImageData(0, 0, 1, 1).data;
+        } catch (error) {
+            return null;
+        }
+        if (pixel[3] < 24) { return null; }
+        return { r: pixel[0], g: pixel[1], b: pixel[2] };
+    }
+
+    function backgroundOf(element) {
+        if (!element) { return null; }
+        return measure(window.getComputedStyle(element).backgroundColor);
+    }
+
+    function resolve() {
+        const candidates = [document.documentElement, document.body];
+        if (document.body) {
+            candidates.push(document.body.firstElementChild);
+            candidates.push(document.elementFromPoint(Math.round(window.innerWidth / 2), 2));
+        }
+        for (const candidate of candidates) {
+            const color = backgroundOf(candidate);
+            if (color) { return color; }
+        }
+        return null;
+    }
+
+    function report() {
+        const color = resolve();
+        if (!color) { return; }
+        const key = color.r + ',' + color.g + ',' + color.b;
+        if (key === lastReported) { return; }
+        lastReported = key;
+        bridge.postMessage(color);
+    }
+
+    let pending = 0;
+    function schedule() {
+        if (pending) { return; }
+        pending = window.setTimeout(function () {
+            pending = 0;
+            report();
+        }, 120);
+    }
+
+    report();
+
+    const observer = new MutationObserver(schedule);
+    const watched = { attributes: true, attributeFilter: ['class', 'style', 'data-theme'] };
+    observer.observe(document.documentElement, watched);
+    if (document.body) { observer.observe(document.body, watched); }
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', schedule);
+    window.addEventListener('focus', schedule);
+    window.setInterval(report, 5000);
+})();
+"""
+
+private let nativeContextMenuActions: Set<Selector> = [
+    #selector(NSText.cut(_:)),
+    #selector(NSText.copy(_:)),
+    #selector(NSText.paste(_:)),
+    #selector(NSText.selectAll(_:)),
+    #selector(NSText.delete(_:)),
+    #selector(NSTextView.pasteAsPlainText(_:)),
+    Selector(("undo:")),
+    Selector(("redo:"))
+]
+
+/// Keeps only the editing commands a native app would offer, so right-clicking never exposes
+/// Reload / Back / Forward / Open in New Window / Inspect Element.
+final class HarnessWebView: WKWebView {
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        for item in menu.items.reversed() {
+            let identifier = item.identifier?.rawValue ?? ""
+            let isCopyVariant = identifier.hasPrefix("WKMenuItemIdentifierCopy")
+            let isEditingCommand = item.action.map { nativeContextMenuActions.contains($0) } ?? false
+            if !isCopyVariant && !isEditingCommand {
+                menu.removeItem(item)
+            }
+        }
+
+        while let first = menu.items.first, first.isSeparatorItem {
+            menu.removeItem(first)
+        }
+        while let last = menu.items.last, last.isSeparatorItem {
+            menu.removeItem(last)
+        }
+    }
+}
+
+private func prefersDarkChrome(red: Double, green: Double, blue: Double, currentlyDark: Bool) -> Bool {
+    let luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+    if luminance < 0.42 { return true }
+    if luminance > 0.58 { return false }
+    return currentlyDark
+}
 
 private struct SemanticVersion: Comparable {
     private enum PrereleaseIdentifier: Equatable {
@@ -112,7 +266,8 @@ private struct NodeRuntime {
     let version: String
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate, NSMenuItemValidation {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate,
+                         WKScriptMessageHandler, NSMenuItemValidation {
     private var window: NSWindow!
     private var webView: WKWebView!
     private var startupView: NSView!
@@ -143,6 +298,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private let maximumPageZoom: CGFloat = 2.0
     private let pageZoomStep: CGFloat = 0.1
     private var currentPageZoom: CGFloat = 1.0
+    private var chromeColor: NSColor = defaultChromeColor
+    private var chromeIsDark = true
+    private var chromeComponents: (red: Double, green: Double, blue: Double) = (0.018, 0.043, 0.115)
     private lazy var workspaceURL: URL = resolveWorkspaceURL()
     private lazy var selectedHarnessPackageVersion: String = resolveSelectedHarnessPackageVersion()
     private var harnessPackageSpecifier: String {
@@ -243,8 +401,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             defer: false
         )
         window.title = appDisplayName
-        window.titleVisibility = .visible
-        window.titlebarAppearsTransparent = false
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+        window.isMovableByWindowBackground = true
+        window.backgroundColor = chromeColor
         window.minSize = NSSize(width: 900, height: 600)
         window.center()
         window.setFrameAutosaveName("DeepSeekHarnessMainWindow")
@@ -253,19 +414,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
         let rootView = NSView(frame: contentRect)
         rootView.wantsLayer = true
-        rootView.layer?.backgroundColor = NSColor(calibratedRed: 0.018, green: 0.043, blue: 0.115, alpha: 1).cgColor
+        rootView.layer?.backgroundColor = chromeColor.cgColor
         window.contentView = rootView
+
+        let contentController = WKUserContentController()
+        contentController.addUserScript(WKUserScript(
+            source: nativeChromeStyleScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        ))
+        contentController.addUserScript(WKUserScript(
+            source: nativeChromeThemeScript,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: true
+        ))
+        contentController.add(self, name: nativeChromeMessageName)
 
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()
         configuration.defaultWebpagePreferences.allowsContentJavaScript = true
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
+        configuration.userContentController = contentController
 
-        webView = WKWebView(frame: .zero, configuration: configuration)
+        webView = HarnessWebView(frame: .zero, configuration: configuration)
         webView.translatesAutoresizingMaskIntoConstraints = false
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsMagnification = false
+        webView.allowsBackForwardNavigationGestures = false
+        webView.allowsLinkPreview = false
+        webView.underPageBackgroundColor = chromeColor
+        webView.wantsLayer = true
         webView.isHidden = true
         rootView.addSubview(webView)
 
@@ -291,7 +470,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private func makeStartupView() -> NSView {
         let view = NSView()
         view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor(calibratedRed: 0.018, green: 0.043, blue: 0.115, alpha: 1).cgColor
+        view.layer?.backgroundColor = chromeColor.cgColor
 
         let iconView = NSImageView()
         iconView.translatesAutoresizingMaskIntoConstraints = false
@@ -301,13 +480,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         statusLabel = NSTextField(labelWithString: "正在启动 DeepSeek Harness")
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.font = NSFont.systemFont(ofSize: 25, weight: .semibold)
-        statusLabel.textColor = .white
         statusLabel.alignment = .center
 
         detailLabel = NSTextField(labelWithString: "正在连接本机服务…")
         detailLabel.translatesAutoresizingMaskIntoConstraints = false
         detailLabel.font = NSFont.systemFont(ofSize: 14, weight: .regular)
-        detailLabel.textColor = NSColor.white.withAlphaComponent(0.68)
         detailLabel.alignment = .center
         detailLabel.maximumNumberOfLines = 3
         detailLabel.lineBreakMode = .byWordWrapping
@@ -344,6 +521,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         stack.setCustomSpacing(8, after: statusLabel)
         stack.setCustomSpacing(24, after: detailLabel)
         view.addSubview(stack)
+        refreshStartupPalette()
 
         NSLayoutConstraint.activate([
             iconView.widthAnchor.constraint(equalToConstant: 132),
@@ -790,7 +968,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
             let process = Process()
             process.executableURL = runtime.npxURL
-            process.arguments = ["--yes", harnessPackageSpecifier, "web"]
+            // The native wrapper owns presentation. Prevent dsh from also opening the
+            // same localhost UI in the user's default browser on every app launch.
+            process.arguments = ["--yes", harnessPackageSpecifier, "web", "--no-open"]
             process.currentDirectoryURL = workspaceURL
             var environment = ProcessInfo.processInfo.environment
             let runtimeBin = runtime.nodeURL.deletingLastPathComponent().path
@@ -1055,8 +1235,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         webView.load(request)
     }
 
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == nativeChromeMessageName, message.frameInfo.isMainFrame else { return }
+
+        let host = message.frameInfo.securityOrigin.host.lowercased()
+        guard host == "127.0.0.1" || host == "localhost" else { return }
+
+        guard let payload = message.body as? [String: Any],
+              let red = (payload["r"] as? NSNumber)?.doubleValue,
+              let green = (payload["g"] as? NSNumber)?.doubleValue,
+              let blue = (payload["b"] as? NSNumber)?.doubleValue else { return }
+
+        applyChromeColor(red: red / 255, green: green / 255, blue: blue / 255)
+    }
+
+    /// Extends the page's own background into the title bar, the window frame and the system
+    /// appearance, so the window reads as one surface instead of a page inside a frame.
+    private func applyChromeColor(red: Double, green: Double, blue: Double) {
+        let normalize: (Double) -> Double = { Swift.min(Swift.max($0, 0), 1) }
+        let components = (red: normalize(red), green: normalize(green), blue: normalize(blue))
+        let isUnchanged = abs(components.red - chromeComponents.red) < 0.004
+            && abs(components.green - chromeComponents.green) < 0.004
+            && abs(components.blue - chromeComponents.blue) < 0.004
+        guard !isUnchanged else { return }
+
+        chromeComponents = components
+        chromeColor = NSColor(
+            srgbRed: CGFloat(components.red),
+            green: CGFloat(components.green),
+            blue: CGFloat(components.blue),
+            alpha: 1
+        )
+        chromeIsDark = prefersDarkChrome(
+            red: components.red,
+            green: components.green,
+            blue: components.blue,
+            currentlyDark: chromeIsDark
+        )
+
+        window.backgroundColor = chromeColor
+        window.contentView?.layer?.backgroundColor = chromeColor.cgColor
+        window.appearance = NSAppearance(named: chromeIsDark ? .darkAqua : .aqua)
+        startupView?.layer?.backgroundColor = chromeColor.cgColor
+        webView?.underPageBackgroundColor = chromeColor
+        refreshStartupPalette()
+    }
+
+    private func refreshStartupPalette() {
+        let primary = chromeIsDark ? NSColor.white : NSColor(srgbRed: 0.09, green: 0.10, blue: 0.13, alpha: 1)
+        statusLabel?.textColor = primary
+        detailLabel?.textColor = primary.withAlphaComponent(0.68)
+    }
+
+    private func revealWebContent() {
+        guard !webView.isHidden || !startupView.isHidden else { return }
+
+        if webView.isHidden {
+            webView.alphaValue = 0
+            webView.isHidden = false
+        }
+
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.24
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            webView.animator().alphaValue = 1
+            startupView.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            guard let self else { return }
+            self.startupView.isHidden = true
+            self.startupView.alphaValue = 1
+            self.progressIndicator.stopAnimation(nil)
+        })
+    }
+
     private func showStartup(status: String, detail: String, isError: Bool) {
+        startupView.alphaValue = 1
         startupView.isHidden = false
+        webView.alphaValue = 1
         webView.isHidden = true
         statusLabel.stringValue = status
         detailLabel.stringValue = detail
@@ -1076,9 +1331,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        startupView.isHidden = true
-        webView.isHidden = false
         window.title = appDisplayName
+        revealWebContent()
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -1161,9 +1415,21 @@ private func runSelfTests() -> Int32 {
         newestOfficialHarnessVersion(in: ["latest": "invalid", "next": "0.1.0-rc.6"]) == "0.1.0-rc.6",
         "ignore invalid official metadata entries"
     )
+    expect(
+        prefersDarkChrome(red: 0.018, green: 0.043, blue: 0.115, currentlyDark: false),
+        "treat the Harness dark background as dark chrome"
+    )
+    expect(
+        !prefersDarkChrome(red: 1, green: 1, blue: 1, currentlyDark: true),
+        "treat a white page as light chrome"
+    )
+    expect(
+        prefersDarkChrome(red: 0.5, green: 0.5, blue: 0.5, currentlyDark: true),
+        "keep the current chrome inside the ambiguous luminance band"
+    )
 
     if failures.isEmpty {
-        print("Self-test passed: semantic versioning and official dist-tag selection")
+        print("Self-test passed: semantic versioning, official dist-tag selection and chrome luminance")
         return 0
     }
 
