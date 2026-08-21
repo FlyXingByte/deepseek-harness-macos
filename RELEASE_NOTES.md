@@ -1,117 +1,66 @@
-# Unofficial macOS Launcher v2.6.0
+<p align="center">
+  <img src="https://raw.githubusercontent.com/FlyXingByte/deepseek-harness-macos/main/Assets/DeepSeekHarness.png" width="112" alt="DeepSeek Harness">
+</p>
 
-Step-by-step Harness core rollback release.
+<h1 align="center">DeepSeek Harness v2.6.0</h1>
 
-## Why this matters
+<p align="center"><strong>内核回退，一次退一步</strong></p>
 
-Until now the launcher could only jump back to the bundled core, so a user who had moved forward across several official releases lost every intermediate version in a single step. This release keeps a history of the versions you actually ran, so a bad upgrade costs you one step back instead of all of them.
+<p align="center">
+  <a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.6.0/DeepSeek-Harness-v2.6.0-macOS-arm64.dmg"><strong>↓ 下载 DMG</strong></a>
+  · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/blob/main/INSTALL.md">安装说明</a>
+  · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/blob/main/CHANGELOG.md">更新历史</a>
+</p>
 
-## Changed
-
-- Replaced the “Restore bundled core” menu action with “Roll back to previous core”, which names the exact version it will return to.
-- Records the outgoing version every time the core is switched, keeping up to 10 entries so repeated rollbacks walk back through the history and eventually reach the bundled version.
-- Disables the menu item when no rollback target exists, instead of offering a no-op restore.
-- The update confirmation sheet now points at the version you are leaving as the rollback target, and the rollback sheet reports how many further steps remain.
-
-## Safety and compatibility
-
-- The service remains bound to `127.0.0.1:3080`; this release does not expose Harness to the LAN.
-- Model credentials, Harness sessions, workspaces, and the user-selected official core version are not migrated or copied by the launcher.
-- Rollback targets are validated as semantic versions and are never allowed below the bundled `@deepseek-ai/dsh@0.1.0-rc.6`, so a launcher upgrade cannot leave an unusable version in the history.
-- Version history starts accumulating from this release; core switches made by earlier builds cannot be reconstructed.
-
-## Distribution status
-
-This build is distributed as an ad-hoc signed, non-notarized prerelease. On first launch, use Finder → right-click → Open; do not disable Gatekeeper.
+<p align="center">
+  <img src="https://img.shields.io/badge/macOS-12%2B-000000?style=flat-square&logo=apple&logoColor=white" alt="macOS 12+">
+  <img src="https://img.shields.io/badge/Apple_Silicon-arm64-000000?style=flat-square" alt="Apple Silicon">
+  <img src="https://img.shields.io/badge/内核-dsh_0.1.0--rc.6-4D6BFE?style=flat-square" alt="DSH 0.1.0-rc.6">
+  <img src="https://img.shields.io/badge/尚未公证-预发布-F59E0B?style=flat-square" alt="未公证">
+</p>
 
 ---
 
-## v2.5.0
+### ✨ 这次更新了什么
 
-Native presentation and browser-launch fix release.
+以前回退只有一个目的地：随 App 内置的默认版本。连着更新过几次之后，一次回退会把中间那些能用的版本全部跳过。
 
-## Highlights
+现在改成按历史逐级回退：
 
-- Blends the standard macOS title bar into the Harness workspace and follows the page's light or dark appearance.
-- Removes common browser tells from the embedded workspace: link previews, hand cursors, draggable page assets, whole-page rubber-band scrolling, WebKit-style context actions, and selectable navigation chrome.
-- Keeps text editing native by preserving cut, copy, paste, undo, redo, delete, and select-all commands where they apply.
+- 🕘 **记住走过的路** —— 每次切换内核前，把你正在用的那一版记入历史，最多 10 条。
+- 🎯 **写明退到哪** —— 菜单项从「恢复内置内核」变成 **回退到上一版内核 0.1.0-rc.6**，标题里直接写明目标版本。
+- ↩️ **连点连退** —— 一路沿历史退回内置版本；没有可退目标时菜单置灰，不会再出现「点了等于没点」。
+- 🛡️ **不会退坏** —— 回退目标按 SemVer 校验，且永不低于内置版本，启动器升级后也不会留下跑不起来的版本。
 
-## Fixed
+> [!NOTE]
+> 版本历史从 v2.6.0 开始累积，更早构建的切换记录无法追溯。
 
-- Starts the official Harness Web UI with `--no-open`, so launching the native App no longer opens the same localhost workspace in Safari or another default browser.
-- Keeps external HTTP and HTTPS links opening in the default browser while the local Harness workspace remains inside the App.
+### 🔒 安全边界没有变化
 
-## Safety and compatibility
+- 服务仍只监听 `127.0.0.1:3080`，不对局域网暴露。
+- 不读取、迁移或修改 API Key、会话与工作区数据。
+- 更新信息只来自固定的 npm 官方 dist-tags 地址，异常版本号会被拒绝。
 
-- The service remains bound to `127.0.0.1:3080`; this release does not expose Harness to the LAN.
-- Model credentials, Harness sessions, workspaces, and the user-selected official core version are not migrated or copied by the launcher.
-- The bundled rollback target remains the previously verified `@deepseek-ai/dsh@0.1.0-rc.6`.
+### 📦 环境要求
 
-## Distribution status
+| 项目 | 要求 |
+| :--- | :--- |
+| 系统 | macOS 12 或更高 |
+| 芯片 | Apple Silicon |
+| Node.js | 22.19–22.x 或 24.0+（不支持 23.x） |
+| Harness 内核 | `@deepseek-ai/dsh@0.1.0-rc.6`，首次启动经你确认后通过 `npx` 获取 |
 
-This build is distributed as an ad-hoc signed, non-notarized prerelease. On first launch, use Finder → right-click → Open; do not disable Gatekeeper.
+### ⚠️ 首次打开
 
----
+本版本为 ad-hoc 签名、**未经 Apple 公证**的预发布版。请在访达中右键 App → **打开** → 再次确认；不要关闭 Gatekeeper。
 
-## v2.4.0
+### 🔐 校验下载
 
-Native Harness core update release.
-
-## Why this matters
-
-The native macOS launcher no longer has to be repackaged every time DeepSeek publishes a new Harness core. Users can keep the verified launcher window, explicitly check the official npm channel, and move to the newest valid release without manually editing commands. The update remains user-confirmed and reversible because upstream is still a developer preview.
-
-## Added
-
-- Added a native “Check and update Harness core” menu action backed only by the official npm dist-tags endpoint.
-- Automatically selects the higher valid `latest` or `next` semantic version after user confirmation.
-- Persists the selected official package version and uses it for subsequent npx launches.
-- Added a native rollback action for the bundled verified `0.1.0-rc.6` version.
-
-## Safety
-
-- Rejects malformed package versions before constructing the npx package specifier.
-- Restarts only a Harness process launched and owned by this App. An external service on port 3080 is never terminated automatically.
-- Keeps updates user-initiated because upstream remains a developer preview with possible breaking changes.
+```sh
+cd ~/Downloads
+shasum -a 256 -c DeepSeek-Harness-v2.6.0-macOS-arm64.dmg.sha256
+```
 
 ---
 
-## v2.3.1
-
-Interaction fix release.
-
-## Fixed
-
-- Added persistent page/font zoom through the native View menu, plus Command-Plus, Command-Minus, and Command-0 shortcuts.
-- Restored the standard macOS title bar so the window can be repositioned by dragging it with the mouse.
-- Kept the embedded Harness content inside the standard content area so WebKit no longer captures title-bar drag gestures.
-
-## Distribution status
-
-This build is distributed as an ad-hoc signed, non-notarized prerelease. On first launch, use Finder → right-click → Open; do not disable Gatekeeper.
-
----
-
-## v2.3
-
-Initial public beta of the portable macOS launcher.
-
-## Included
-
-- Native WKWebView window tied to the whale Dock icon.
-- Portable workspace selection with no machine-specific user paths.
-- First-run confirmation before npx obtains the pinned official Harness package.
-- Localhost-only Harness page loading and external-link handoff to the default browser.
-- Drag-to-Applications DMG and SHA-256 checksum.
-
-## Requirements
-
-- macOS 12 or newer.
-- Apple Silicon.
-- Node.js 22.19+ or 24+ with npx.
-
-## Important
-
-This build is ad-hoc signed and not notarized because no Apple Developer ID certificate is available. It is published as a prerelease. On first launch, use Finder → right-click → Open. Do not disable Gatekeeper.
-
-This is an unofficial launcher and is not affiliated with or endorsed by DeepSeek.
+<p align="center"><sub>非官方启动器 · 与 DeepSeek、Apple Inc. 无隶属、赞助或背书关系 · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/blob/main/LICENSE">MIT</a> · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/blob/main/NOTICE.md">NOTICE</a></sub></p>

@@ -189,4 +189,4 @@ shasum -a 256 -c DeepSeek-Harness-v2.6.0-macOS-arm64.dmg.sha256
 
 ---
 
-<p align="center"><sub><a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/tag/v2.6.0">v2.6.0</a> · DSH 0.1.0-rc.6 · arm64 · <a href="./LICENSE">MIT</a> · <a href="./NOTICE.md">NOTICE</a> · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/issues">Issues</a></sub></p>
+<p align="center"><sub><a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/tag/v2.6.0">v2.6.0</a> · <a href="./CHANGELOG.md">更新历史</a> · DSH 0.1.0-rc.6 · arm64 · <a href="./LICENSE">MIT</a> · <a href="./NOTICE.md">NOTICE</a> · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/issues">Issues</a></sub></p>
