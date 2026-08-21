@@ -278,7 +278,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var logButton: NSButton!
     private var harnessVersionMenuItem: NSMenuItem!
     private var checkHarnessUpdateMenuItem: NSMenuItem!
-    private var restoreBundledHarnessMenuItem: NSMenuItem!
+    private var rollBackHarnessMenuItem: NSMenuItem!
 
     private var probeTimer: Timer?
     private var probeAttempts = 0
@@ -293,6 +293,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private let workspaceDefaultsKey = "HarnessWorkspacePath"
     private let packageApprovalDefaultsKey = "ApprovedOfficialHarnessPackageDownload"
     private let harnessVersionDefaultsKey = "SelectedOfficialHarnessPackageVersion"
+    private let harnessVersionHistoryDefaultsKey = "OfficialHarnessPackageVersionHistory"
+    private let harnessVersionHistoryLimit = 10
     private let pageZoomDefaultsKey = "HarnessPageZoom"
     private let minimumPageZoom: CGFloat = 0.75
     private let maximumPageZoom: CGFloat = 2.0
@@ -303,6 +305,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var chromeComponents: (red: Double, green: Double, blue: Double) = (0.018, 0.043, 0.115)
     private lazy var workspaceURL: URL = resolveWorkspaceURL()
     private lazy var selectedHarnessPackageVersion: String = resolveSelectedHarnessPackageVersion()
+    private lazy var harnessPackageVersionHistory: [String] = resolveHarnessPackageVersionHistory()
+    private var previousHarnessPackageVersion: String? {
+        harnessPackageVersionHistory.last
+    }
     private var harnessPackageSpecifier: String {
         "\(harnessPackageName)@\(selectedHarnessPackageVersion)"
     }
@@ -557,13 +563,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         checkHarnessUpdateMenuItem = NSMenuItem(title: "检查并更新 Harness 内核…", action: #selector(checkForHarnessUpdate(_:)), keyEquivalent: "")
         checkHarnessUpdateMenuItem.target = self
         appMenu.addItem(checkHarnessUpdateMenuItem)
-        restoreBundledHarnessMenuItem = NSMenuItem(
-            title: "恢复内置内核 \(bundledHarnessPackageVersion)",
-            action: #selector(restoreBundledHarnessVersion(_:)),
+        rollBackHarnessMenuItem = NSMenuItem(
+            title: rollBackHarnessMenuItemTitle,
+            action: #selector(rollBackToPreviousHarnessVersion(_:)),
             keyEquivalent: ""
         )
-        restoreBundledHarnessMenuItem.target = self
-        appMenu.addItem(restoreBundledHarnessMenuItem)
+        rollBackHarnessMenuItem.target = self
+        appMenu.addItem(rollBackHarnessMenuItem)
         appMenu.addItem(.separator())
         let projectItem = NSMenuItem(title: "打开 Harness 官方项目", action: #selector(openHarnessProject(_:)), keyEquivalent: "")
         projectItem.target = self
@@ -680,8 +686,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         if menuItem === checkHarnessUpdateMenuItem {
             return !isCheckingForHarnessUpdate
         }
-        if menuItem === restoreBundledHarnessMenuItem {
-            return !isCheckingForHarnessUpdate && selectedHarnessPackageVersion != bundledHarnessPackageVersion
+        if menuItem === rollBackHarnessMenuItem {
+            return !isCheckingForHarnessUpdate && previousHarnessPackageVersion != nil
         }
         return true
     }
@@ -691,9 +697,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         checkHarnessUpdateMenuItem?.title = isCheckingForHarnessUpdate
             ? "正在检查官方更新…"
             : "检查并更新 Harness 内核…"
-        restoreBundledHarnessMenuItem?.title = "恢复内置内核 \(bundledHarnessPackageVersion)"
-        restoreBundledHarnessMenuItem?.isEnabled = selectedHarnessPackageVersion != bundledHarnessPackageVersion
+        rollBackHarnessMenuItem?.title = rollBackHarnessMenuItemTitle
+        rollBackHarnessMenuItem?.isEnabled = previousHarnessPackageVersion != nil
         NSApp.mainMenu?.update()
+    }
+
+    private var rollBackHarnessMenuItemTitle: String {
+        guard let previousVersion = previousHarnessPackageVersion else {
+            return "回退到上一版内核"
+        }
+        return "回退到上一版内核 \(previousVersion)"
     }
 
     @objc private func checkForHarnessUpdate(_ sender: Any?) {
@@ -765,7 +778,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             let alert = NSAlert()
             alert.alertStyle = .informational
             alert.messageText = "发现官方 Harness 内核更新"
-            alert.informativeText = "当前：\(selectedHarnessPackageVersion)\n新版：\(newestVersion)\n\n继续后将从 npm 官方注册表获取新版。Harness 仍处于 Developer Preview，新版可能包含不兼容变化；你可以随时从 App 菜单恢复内置版本 \(bundledHarnessPackageVersion)。"
+            alert.informativeText = "当前：\(selectedHarnessPackageVersion)\n新版：\(newestVersion)\n\n继续后将从 npm 官方注册表获取新版。Harness 仍处于 Developer Preview，新版可能包含不兼容变化；你可以随时从 App 菜单回退到上一版 \(selectedHarnessPackageVersion)。"
             alert.addButton(withTitle: "更新并重启")
             alert.addButton(withTitle: "取消")
             alert.beginSheetModal(for: window) { [weak self] response in
@@ -775,25 +788,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
     }
 
-    @objc private func restoreBundledHarnessVersion(_ sender: Any?) {
-        guard selectedHarnessPackageVersion != bundledHarnessPackageVersion else { return }
+    @objc private func rollBackToPreviousHarnessVersion(_ sender: Any?) {
+        guard !isCheckingForHarnessUpdate,
+              let previousVersion = previousHarnessPackageVersion,
+              SemanticVersion(previousVersion) != nil else { return }
 
+        let remainingSteps = harnessPackageVersionHistory.count - 1
         let alert = NSAlert()
         alert.alertStyle = .informational
-        alert.messageText = "恢复内置 Harness 内核？"
-        alert.informativeText = "当前：\(selectedHarnessPackageVersion)\n恢复为：\(bundledHarnessPackageVersion)"
-        alert.addButton(withTitle: "恢复并重启")
+        alert.messageText = "回退到上一版 Harness 内核？"
+        var detail = "当前：\(selectedHarnessPackageVersion)\n回退为：\(previousVersion)"
+        if remainingSteps > 0 {
+            detail += "\n\n回退后还可以继续向前回退 \(remainingSteps) 步。"
+        }
+        alert.informativeText = detail
+        alert.addButton(withTitle: "回退并重启")
         alert.addButton(withTitle: "取消")
         alert.beginSheetModal(for: window) { [weak self] response in
             guard response == .alertFirstButtonReturn else { return }
-            self?.selectHarnessPackageVersion(bundledHarnessPackageVersion)
+            self?.applyPreviousHarnessPackageVersion(previousVersion)
         }
     }
 
-    private func selectHarnessPackageVersion(_ version: String) {
+    private func applyPreviousHarnessPackageVersion(_ version: String) {
+        // The sheet is asynchronous, so make sure the history did not move on meanwhile.
+        guard harnessPackageVersionHistory.last == version else {
+            refreshHarnessVersionMenuItems()
+            return
+        }
+
+        harnessPackageVersionHistory.removeLast()
+        persistHarnessPackageVersionHistory()
+        selectHarnessPackageVersion(version, recordingHistory: false)
+    }
+
+    private func selectHarnessPackageVersion(_ version: String, recordingHistory: Bool = true) {
         guard SemanticVersion(version) != nil else {
             presentAlert(title: "版本无效", detail: "没有更改当前 Harness 内核。", style: .warning)
             return
+        }
+        guard version != selectedHarnessPackageVersion else { return }
+
+        if recordingHistory {
+            recordHarnessPackageVersionInHistory(selectedHarnessPackageVersion)
         }
 
         selectedHarnessPackageVersion = version
@@ -851,6 +888,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             return bundledHarnessPackageVersion
         }
         return storedValue
+    }
+
+    private func recordHarnessPackageVersionInHistory(_ version: String) {
+        guard SemanticVersion(version) != nil else { return }
+
+        harnessPackageVersionHistory.removeAll { $0 == version }
+        harnessPackageVersionHistory.append(version)
+        if harnessPackageVersionHistory.count > harnessVersionHistoryLimit {
+            harnessPackageVersionHistory.removeFirst(harnessPackageVersionHistory.count - harnessVersionHistoryLimit)
+        }
+        persistHarnessPackageVersionHistory()
+    }
+
+    private func persistHarnessPackageVersionHistory() {
+        UserDefaults.standard.set(harnessPackageVersionHistory, forKey: harnessVersionHistoryDefaultsKey)
+    }
+
+    private func resolveHarnessPackageVersionHistory() -> [String] {
+        guard let bundledVersion = SemanticVersion(bundledHarnessPackageVersion),
+              let storedValues = UserDefaults.standard.array(forKey: harnessVersionHistoryDefaultsKey) as? [String] else {
+            return []
+        }
+
+        var history: [String] = []
+        for value in storedValues {
+            guard let version = SemanticVersion(value),
+                  bundledVersion <= version,
+                  value != selectedHarnessPackageVersion else { continue }
+            history.removeAll { $0 == value }
+            history.append(value)
+        }
+
+        return Array(history.suffix(harnessVersionHistoryLimit))
     }
 
     private func presentAlert(title: String, detail: String, style: NSAlert.Style) {

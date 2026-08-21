@@ -4,7 +4,7 @@
 <p align="center">非官方启动器 · 独立窗口 · 本机工作区</p>
 
 <p align="center">
-  <a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.5.0/DeepSeek-Harness-v2.5.0-macOS-arm64.dmg"><strong>↓ 下载 v2.5.0</strong></a>
+  <a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.6.0/DeepSeek-Harness-v2.6.0-macOS-arm64.dmg"><strong>↓ 下载 v2.6.0</strong></a>
 </p>
 <p align="center">
   <a href="./INSTALL.md">安装说明</a>
@@ -14,7 +14,7 @@
 <p align="center">Apple Silicon · macOS 12+ · Node.js 22.19–22.x 或 24.0+（不支持 23.x）</p>
 
 > [!WARNING]
-> **v2.5.0 尚未公证。** 首次打开：在访达中右键 App → **打开** → 再确认；不要关闭 Gatekeeper。
+> **v2.6.0 尚未公证。** 首次打开：在访达中右键 App → **打开** → 再确认；不要关闭 Gatekeeper。
 
 <p align="center">
   <picture>
@@ -31,9 +31,22 @@
 - **从程序坞打开**：独立窗口、菜单栏和 App 图标。
 - **原生窗口交互**：拖动标题栏移动窗口；`Command +` / `Command -` 调整字体，`Command 0` 恢复默认大小。
 - **没有浏览器痕迹**：标题栏与工作台背景融为一体并跟随明暗主题；右键只保留原生编辑命令，控件不再出现网页手型光标与文字选中，整页橡皮筋回弹和网页滚动条也一并去掉。
-- **一键检查内核更新**：从 App 菜单读取 npm 官方 `latest` / `next`，自动选择更高版本，并保留内置版本作为回退。
+- **一键检查内核更新**：从 App 菜单读取 npm 官方 `latest` / `next`，自动选择更高版本；每次切换都会记录旧版本，随时可以回退到上一版。
 - **服务留在本机**：Harness Web UI 仅监听 `127.0.0.1:3080`。
 - **工作区由你选择**：使用隔离的默认目录，或切换到自己的项目文件夹。
+
+## v2.6.0 重点更新：内核回退，一次退一步
+
+v2.4.0 让你可以自己跟进官方内核，但当时的回退只有一个目的地——随 App 内置的默认版本。如果你已经连着更新过好几次，一次回退就会把中间那些能用的版本全部跳过。
+
+v2.6.0 改成按历史逐级回退：
+
+- 每次切换内核前，启动器都会把**正在使用的那一版**记入历史（最多 10 条）。
+- 菜单项从「恢复内置内核」变成 **回退到上一版内核 …**，标题里直接写明这次会退回哪个版本。
+- 连续点击就会沿着历史一路往回退，最终回到内置版本；没有可回退的目标时，菜单项是灰色的，不会再出现点了等于没点的情况。
+- 回退目标会按 SemVer 校验，且永远不会低于内置的 `0.1.0-rc.6`，所以以后升级启动器也不会在历史里留下跑不起来的版本。
+
+版本历史从本次发布开始累积，更早的切换记录无法追溯。
 
 ## v2.5.0 重点更新：像 App 一样打开，不再弹出 Safari
 
@@ -53,7 +66,7 @@ Harness 的工作台本质仍由官方 Web UI 提供，macOS 启动器继续使�
 
 - **Harness 内核：0.1.0-rc.6**：显示当前选择的内核版本。
 - **检查并更新 Harness 内核…**：一键读取 npm 官方 `latest` 与 `next`，通过 SemVer 自动选择更高版本。
-- **恢复内置内核 0.1.0-rc.6**：新版出现兼容问题时，可以直接回退到随 App 验证过的默认版本。
+- **回退到上一版内核 0.1.0-rc.6**：新版出现兼容问题时，可以回退到切换之前正在使用的那一版；连续更新过多次时，可以逐级往回退，最终回到内置的默认版本。
 
 更新过程保留了一道人为确认：发现新版后，App 会先显示当前版本和目标版本，只有点击 **更新并重启** 才会切换。这不是后台静默升级，因为 Harness 仍处于 Developer Preview，新版本可能包含破坏兼容性的变化。
 
@@ -65,7 +78,7 @@ Harness 的工作台本质仍由官方 Web UI 提供，macOS 启动器继续使�
 
 ## 三步安装
 
-1. [下载 v2.5.0 DMG](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.5.0/DeepSeek-Harness-v2.5.0-macOS-arm64.dmg)，打开后把 **DeepSeek Harness.app** 拖入 **Applications**。
+1. [下载 v2.6.0 DMG](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.6.0/DeepSeek-Harness-v2.6.0-macOS-arm64.dmg)，打开后把 **DeepSeek Harness.app** 拖入 **Applications**。
 2. 在“应用程序”中右键 App，选择 **打开**，然后在 macOS 提示中再次确认。
 3. 首次启动时确认通过 `npx` 获取默认版本的官方 `@deepseek-ai/dsh@0.1.0-rc.6`，等待工作台出现。
 
@@ -102,7 +115,7 @@ Harness 的工作台本质仍由官方 Web UI 提供，macOS 启动器继续使�
 - **Node.js**：由用户安装，用于运行 `npx` 与 Harness。
 
 > [!NOTE]
-> DeepSeek Harness 仍处于 **Developer Preview**，可能出现破坏兼容性的变化。本启动器内置默认版本 `@deepseek-ai/dsh@0.1.0-rc.6`；只有你主动选择“检查并更新 Harness 内核…”并确认后，才会切换到 npm 官方 `latest` / `next` 中更高的版本。内置版本始终可从菜单恢复。
+> DeepSeek Harness 仍处于 **Developer Preview**，可能出现破坏兼容性的变化。本启动器内置默认版本 `@deepseek-ai/dsh@0.1.0-rc.6`；只有你主动选择“检查并更新 Harness 内核…”并确认后，才会切换到 npm 官方 `latest` / `next` 中更高的版本。每次切换前的版本都会记入历史，可从菜单逐级回退，直到回到内置版本。
 
 这是 FlyX 独立制作的非官方启动器，与 DeepSeek 或 Apple Inc. 无隶属、赞助或背书关系。名称仅用于说明兼容性；鲸鱼图标与主视觉不是官方素材。
 
@@ -148,16 +161,18 @@ Harness 的工作台本质仍由官方 Web UI 提供，macOS 启动器继续使�
 
 **怎样更新 Harness 内核？** 打开菜单栏中的 **DeepSeek Harness → 检查并更新 Harness 内核…**。若官方存在更高版本，启动器会自动选中并请求确认；若当前 3080 服务由其他终端启动，只保存选择，不会擅自终止外部进程。
 
+**新内核不好用怎么办？** 打开 **DeepSeek Harness → 回退到上一版内核 …**，菜单里直接显示会回退到哪个版本。启动器最多记录 10 次切换历史，可以连续回退；没有可回退的版本时该菜单项为灰色。
+
 </details>
 
 <details>
 <summary><strong>验证下载文件与本地构建</strong></summary>
 
-下载 [SHA-256 文件](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.5.0/DeepSeek-Harness-v2.5.0-macOS-arm64.dmg.sha256) 后，在终端运行：
+下载 [SHA-256 文件](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.6.0/DeepSeek-Harness-v2.6.0-macOS-arm64.dmg.sha256) 后，在终端运行：
 
 ```sh
 cd ~/Downloads
-shasum -a 256 -c DeepSeek-Harness-v2.5.0-macOS-arm64.dmg.sha256
+shasum -a 256 -c DeepSeek-Harness-v2.6.0-macOS-arm64.dmg.sha256
 ```
 
 本地构建与验证：
@@ -174,4 +189,4 @@ shasum -a 256 -c DeepSeek-Harness-v2.5.0-macOS-arm64.dmg.sha256
 
 ---
 
-<p align="center"><sub><a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/tag/v2.5.0">v2.5.0</a> · DSH 0.1.0-rc.6 · arm64 · <a href="./LICENSE">MIT</a> · <a href="./NOTICE.md">NOTICE</a> · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/issues">Issues</a></sub></p>
+<p align="center"><sub><a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/tag/v2.6.0">v2.6.0</a> · DSH 0.1.0-rc.6 · arm64 · <a href="./LICENSE">MIT</a> · <a href="./NOTICE.md">NOTICE</a> · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/issues">Issues</a></sub></p>

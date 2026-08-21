@@ -1,4 +1,32 @@
-# Unofficial macOS Launcher v2.5.0
+# Unofficial macOS Launcher v2.6.0
+
+Step-by-step Harness core rollback release.
+
+## Why this matters
+
+Until now the launcher could only jump back to the bundled core, so a user who had moved forward across several official releases lost every intermediate version in a single step. This release keeps a history of the versions you actually ran, so a bad upgrade costs you one step back instead of all of them.
+
+## Changed
+
+- Replaced the “Restore bundled core” menu action with “Roll back to previous core”, which names the exact version it will return to.
+- Records the outgoing version every time the core is switched, keeping up to 10 entries so repeated rollbacks walk back through the history and eventually reach the bundled version.
+- Disables the menu item when no rollback target exists, instead of offering a no-op restore.
+- The update confirmation sheet now points at the version you are leaving as the rollback target, and the rollback sheet reports how many further steps remain.
+
+## Safety and compatibility
+
+- The service remains bound to `127.0.0.1:3080`; this release does not expose Harness to the LAN.
+- Model credentials, Harness sessions, workspaces, and the user-selected official core version are not migrated or copied by the launcher.
+- Rollback targets are validated as semantic versions and are never allowed below the bundled `@deepseek-ai/dsh@0.1.0-rc.6`, so a launcher upgrade cannot leave an unusable version in the history.
+- Version history starts accumulating from this release; core switches made by earlier builds cannot be reconstructed.
+
+## Distribution status
+
+This build is distributed as an ad-hoc signed, non-notarized prerelease. On first launch, use Finder → right-click → Open; do not disable Gatekeeper.
+
+---
+
+## v2.5.0
 
 Native presentation and browser-launch fix release.
 
