@@ -2,12 +2,12 @@
   <img src="https://raw.githubusercontent.com/FlyXingByte/deepseek-harness-macos/main/Assets/DeepSeekHarness.png" width="112" alt="DeepSeek Harness">
 </p>
 
-<h1 align="center">DeepSeek Harness v2.6.0</h1>
+<h1 align="center">DeepSeek Harness v2.7.0</h1>
 
-<p align="center"><strong>内核回退，一次退一步</strong></p>
+<p align="center"><strong>归档之后，可以真正删除</strong></p>
 
 <p align="center">
-  <a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.6.0/DeepSeek-Harness-v2.6.0-macOS-arm64.dmg"><strong>↓ 下载 DMG</strong></a>
+  <a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.7.0/DeepSeek-Harness-v2.7.0-macOS-arm64.dmg"><strong>↓ 下载 DMG</strong></a>
   · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/blob/main/INSTALL.md">安装说明</a>
   · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/blob/main/CHANGELOG.md">更新历史</a>
 </p>
@@ -23,23 +23,24 @@
 
 ### ✨ 这次更新了什么
 
-以前回退只有一个目的地：随 App 内置的默认版本。连着更新过几次之后，一次回退会把中间那些能用的版本全部跳过。
+官方内核只提供归档：会话从侧边栏消失，完整记录仍然留在 `~/.dsh/sessions` 里，一个字节都没少。v2.7.0 让启动器接手最后一步。
 
-现在改成按历史逐级回退：
-
-- 🕘 **记住走过的路** —— 每次切换内核前，把你正在用的那一版记入历史，最多 10 条。
-- 🎯 **写明退到哪** —— 菜单项从「恢复内置内核」变成 **回退到上一版内核 0.1.0-rc.6**，标题里直接写明目标版本。
-- ↩️ **连点连退** —— 一路沿历史退回内置版本；没有可退目标时菜单置灰，不会再出现「点了等于没点」。
-- 🛡️ **不会退坏** —— 回退目标按 SemVer 校验，且永不低于内置版本，启动器升级后也不会留下跑不起来的版本。
+- 🗑️ **一键清除** —— App 菜单新增 **清除已归档的会话…（N 个）**，标题里直接写明有多少个可清；没有归档会话时置灰。
+- 🧾 **先算再问** —— 确认框写明这次会清掉几个会话、多少体积，确认之后才动手。
+- ♻️ **进废纸篓，不是凭空消失** —— 会话记录移入废纸篓，误清可以直接拖回来。
+- 🧹 **列表一起清干净** —— 同时清理 `workspace.json` 的归档集合与工作区成员，以及 `session_projcache.json` 里的标题和统计缓存，侧边栏不留残影。
+- 🛟 **改写前自动备份** —— 两个列表文件在改写前备份到 `~/Library/Logs/DeepSeek Harness/storage-backups/`，只保留最近 5 份。
 
 > [!NOTE]
-> 版本历史从 v2.6.0 开始累积，更早构建的切换记录无法追溯。
+> 内核会把会话列表常驻内存并回写，所以清除时会先停止再重启 Harness 内核，工作台里未发送的内容可能丢失。如果 `127.0.0.1:3080` 是你在终端里启动的服务，启动器只提示你先停掉它，不会擅自终止外部进程。
 
-### 🔒 安全边界没有变化
+### 🔒 安全边界
 
-- 服务仍只监听 `127.0.0.1:3080`，不对局域网暴露。
-- 不读取、迁移或修改 API Key、会话与工作区数据。
-- 更新信息只来自固定的 npm 官方 dist-tags 地址，异常版本号会被拒绝。
+- 只删除 `<DSH_HOME>/sessions/<项目>/<会话>` 这一层，路径形状不符即跳过并报告，不会波及其他目录。
+- 某个目录没能移入废纸篓时，它的列表条目会被保留，不会产生看不见的孤儿记录。
+- 子代理会话记录不会被连带删除：父子关系只存在于 zstd 压缩的日志头内，启动器不做猜测。
+- `DSH_HOME` 按官方规则解析（含 `~` 展开、空值视为未设置），不写死 `~/.dsh`。
+- 服务仍只监听 `127.0.0.1:3080`；不读取、迁移或修改 API Key 与工作区数据。
 
 ### 📦 环境要求
 
@@ -58,7 +59,7 @@
 
 ```sh
 cd ~/Downloads
-shasum -a 256 -c DeepSeek-Harness-v2.6.0-macOS-arm64.dmg.sha256
+shasum -a 256 -c DeepSeek-Harness-v2.7.0-macOS-arm64.dmg.sha256
 ```
 
 ---

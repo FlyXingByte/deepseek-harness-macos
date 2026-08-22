@@ -243,6 +243,127 @@ private func newestOfficialHarnessVersion(in distTags: [String: String]) -> Stri
     return candidates.max { $0.1 < $1.1 }?.0
 }
 
+private let dshHomeEnvironmentKey = "DSH_HOME"
+private let dshHomeDirectoryName = ".dsh"
+private let harnessSessionsDirectoryName = "sessions"
+private let harnessStoragesDirectoryName = "storages"
+private let harnessWorkspaceRegistryFileName = "workspace.json"
+private let harnessSessionCacheFileName = "session_projcache.json"
+private let harnessStorageBackupLimit = 5
+
+/// Expands the tilde prefixes the official harness accepts in `$DSH_HOME`.
+private func expandHarnessHomePath(_ path: String, home: URL) -> String {
+    if path == "~" { return home.path }
+    if path.hasPrefix("~/") {
+        return home.appendingPathComponent(String(path.dropFirst(2))).path
+    }
+    return path
+}
+
+/// Resolves the single root the official Harness keeps user data under: `$DSH_HOME`
+/// when it names something, otherwise `~/.dsh`. Mirrors `@deepseek-ai/dsh-home-paths`,
+/// so the launcher reads exactly the files the running kernel writes.
+private func resolveHarnessHomeURL(
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    home: URL = FileManager.default.homeDirectoryForCurrentUser
+) -> URL {
+    let configured = environment[dshHomeEnvironmentKey]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !configured.isEmpty else {
+        return home.appendingPathComponent(dshHomeDirectoryName, isDirectory: true).standardizedFileURL
+    }
+    return URL(fileURLWithPath: expandHarnessHomePath(configured, home: home), isDirectory: true).standardizedFileURL
+}
+
+/// The archived sessions the kernel hides from the sidebar, in registry order and
+/// without duplicates. Archiving never touches the transcript, so these ids are the
+/// exact set whose records the user asked to be gone rather than merely hidden.
+private func archivedSessionIds(in registry: [String: Any]) -> [String] {
+    guard let global = registry["global"] as? [String: Any],
+          let storedIds = global["archivedSessionIds"] as? [Any] else { return [] }
+
+    var seen = Set<String>()
+    var ids: [String] = []
+    for value in storedIds {
+        guard let id = value as? String, !id.isEmpty, seen.insert(id).inserted else { continue }
+        ids.append(id)
+    }
+    return ids
+}
+
+private func filteredSessionIdList(_ values: [Any], removing ids: Set<String>) -> [Any] {
+    values.filter { value in
+        guard let id = value as? String else { return true }
+        return !ids.contains(id)
+    }
+}
+
+/// Drops the removed sessions from the workspace registry: the registry-global archive
+/// set and every workspace's ordered member list. Unknown keys are copied through, so a
+/// newer kernel's registry survives the rewrite.
+private func workspaceRegistry(_ registry: [String: Any], removingSessionIds ids: Set<String>) -> [String: Any] {
+    guard !ids.isEmpty else { return registry }
+    var updated = registry
+
+    if var global = registry["global"] as? [String: Any] {
+        if let archived = global["archivedSessionIds"] as? [Any] {
+            global["archivedSessionIds"] = filteredSessionIdList(archived, removing: ids)
+        }
+        updated["global"] = global
+    }
+
+    if var tables = registry["tables"] as? [String: Any],
+       var workspaces = tables["workspaces"] as? [String: Any] {
+        for (workspaceId, value) in workspaces {
+            guard var workspace = value as? [String: Any],
+                  let sessionIds = workspace["sessionIds"] as? [Any] else { continue }
+            workspace["sessionIds"] = filteredSessionIdList(sessionIds, removing: ids)
+            workspaces[workspaceId] = workspace
+        }
+        tables["workspaces"] = workspaces
+        updated["tables"] = tables
+    }
+
+    return updated
+}
+
+/// Drops the removed sessions from the projection cache that backs sidebar titles and
+/// statistics; leaving them behind would keep deleted conversations named in the UI.
+private func sessionProjectionCache(_ cache: [String: Any], removingSessionIds ids: Set<String>) -> [String: Any] {
+    guard !ids.isEmpty,
+          var tables = cache["tables"] as? [String: Any],
+          var sessions = tables["sessions"] as? [String: Any] else { return cache }
+
+    for id in ids {
+        sessions.removeValue(forKey: id)
+    }
+    tables["sessions"] = sessions
+    var updated = cache
+    updated["tables"] = tables
+    return updated
+}
+
+/// What one cleanup would remove, measured before the user is asked to confirm.
+private struct ArchivedSessionCleanupPlan {
+    let sessionIds: [String]
+    /// Transcript directories that exist on disk. Archived sessions that never wrote a
+    /// transcript have no directory and only leave registry entries behind.
+    let directories: [URL]
+    let byteSize: Int64
+
+    static let empty = ArchivedSessionCleanupPlan(sessionIds: [], directories: [], byteSize: 0)
+
+    var isEmpty: Bool { sessionIds.isEmpty }
+}
+
+/// What one cleanup actually removed, reported back to the user afterwards.
+private struct ArchivedSessionCleanupOutcome {
+    var trashedDirectories = 0
+    var freedBytes: Int64 = 0
+    var removedRegistryEntries = 0
+    var backupDirectory: URL?
+    var failures: [String] = []
+}
+
 private enum HarnessUpdateError: LocalizedError {
     case invalidResponse
     case httpStatus(Int)
@@ -279,6 +400,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var harnessVersionMenuItem: NSMenuItem!
     private var checkHarnessUpdateMenuItem: NSMenuItem!
     private var rollBackHarnessMenuItem: NSMenuItem!
+    private var purgeArchivedSessionsMenuItem: NSMenuItem!
 
     private var probeTimer: Timer?
     private var probeAttempts = 0
@@ -290,6 +412,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var isTerminating = false
     private var harnessPageHasLoaded = false
     private var isCheckingForHarnessUpdate = false
+    private var pendingArchivedSessionCleanup: ArchivedSessionCleanupPlan?
     private let workspaceDefaultsKey = "HarnessWorkspacePath"
     private let packageApprovalDefaultsKey = "ApprovedOfficialHarnessPackageDownload"
     private let harnessVersionDefaultsKey = "SelectedOfficialHarnessPackageVersion"
@@ -571,6 +694,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         rollBackHarnessMenuItem.target = self
         appMenu.addItem(rollBackHarnessMenuItem)
         appMenu.addItem(.separator())
+        purgeArchivedSessionsMenuItem = NSMenuItem(
+            title: purgeArchivedSessionsMenuItemTitle(count: 0),
+            action: #selector(purgeArchivedSessions(_:)),
+            keyEquivalent: ""
+        )
+        purgeArchivedSessionsMenuItem.target = self
+        appMenu.addItem(purgeArchivedSessionsMenuItem)
+        appMenu.addItem(.separator())
         let projectItem = NSMenuItem(title: "打开 Harness 官方项目", action: #selector(openHarnessProject(_:)), keyEquivalent: "")
         projectItem.target = self
         appMenu.addItem(projectItem)
@@ -688,6 +819,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
         if menuItem === rollBackHarnessMenuItem {
             return !isCheckingForHarnessUpdate && previousHarnessPackageVersion != nil
+        }
+        if menuItem === purgeArchivedSessionsMenuItem {
+            // Reading only the registry keeps this cheap enough to run each time the menu opens;
+            // transcript sizes are measured later, once the user asks for the cleanup itself.
+            let archivedCount = archivedSessionIds(in: loadHarnessStorage(at: workspaceRegistryURL) ?? [:]).count
+            menuItem.title = purgeArchivedSessionsMenuItemTitle(count: archivedCount)
+            return archivedCount > 0
         }
         return true
     }
@@ -932,6 +1070,297 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         alert.beginSheetModal(for: window)
     }
 
+    // MARK: - Archived session cleanup
+
+    private var harnessHomeURL: URL {
+        resolveHarnessHomeURL()
+    }
+
+    private var harnessSessionsRootURL: URL {
+        harnessHomeURL.appendingPathComponent(harnessSessionsDirectoryName, isDirectory: true).standardizedFileURL
+    }
+
+    private var workspaceRegistryURL: URL {
+        harnessHomeURL
+            .appendingPathComponent(harnessStoragesDirectoryName, isDirectory: true)
+            .appendingPathComponent(harnessWorkspaceRegistryFileName, isDirectory: false)
+    }
+
+    private var sessionCacheURL: URL {
+        harnessHomeURL
+            .appendingPathComponent(harnessStoragesDirectoryName, isDirectory: true)
+            .appendingPathComponent(harnessSessionCacheFileName, isDirectory: false)
+    }
+
+    private func purgeArchivedSessionsMenuItemTitle(count: Int) -> String {
+        count > 0 ? "清除已归档的会话…（\(count) 个）" : "清除已归档的会话…"
+    }
+
+    private func loadHarnessStorage(at url: URL) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: url),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return object
+    }
+
+    private func writeHarnessStorage(_ storage: [String: Any], to url: URL) throws {
+        let data = try JSONSerialization.data(withJSONObject: storage)
+        try data.write(to: url, options: .atomic)
+    }
+
+    private func directoryByteSize(of url: URL) -> Int64 {
+        // Hidden files count: the whole directory is what moves to the Trash.
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileAllocatedSizeKey, .fileSizeKey]
+        ) else { return 0 }
+
+        var total: Int64 = 0
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileAllocatedSizeKey, .fileSizeKey]),
+                  values.isRegularFile == true else { continue }
+            total += Int64(values.fileAllocatedSize ?? values.fileSize ?? 0)
+        }
+        return total
+    }
+
+    /// Finds the transcript directories of the given sessions by scanning the project
+    /// directories under the sessions root. The kernel escapes session ids into path
+    /// segments, so matching what is on disk is safer than re-deriving the encoding here:
+    /// an id whose directory is not found simply keeps its files and loses no data.
+    private func locateSessionDirectories(ids: Set<String>) -> [URL] {
+        let root = harnessSessionsRootURL
+        guard let projectDirectories = try? FileManager.default.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        var located: [URL] = []
+        for projectDirectory in projectDirectories {
+            guard (try? projectDirectory.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true,
+                  let sessionDirectories = try? FileManager.default.contentsOfDirectory(
+                      at: projectDirectory,
+                      includingPropertiesForKeys: [.isDirectoryKey],
+                      options: [.skipsHiddenFiles]
+                  ) else { continue }
+
+            for sessionDirectory in sessionDirectories {
+                guard ids.contains(sessionDirectory.lastPathComponent),
+                      (try? sessionDirectory.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { continue }
+                located.append(sessionDirectory.standardizedFileURL)
+            }
+        }
+        return located.sorted { $0.path < $1.path }
+    }
+
+    /// Guards every removal: only `<harness home>/sessions/<project>/<session>` may be trashed.
+    private func isRemovableSessionDirectory(_ url: URL) -> Bool {
+        let sessionDirectory = url.standardizedFileURL
+        let projectDirectory = sessionDirectory.deletingLastPathComponent()
+        return projectDirectory.deletingLastPathComponent().path == harnessSessionsRootURL.path
+            && !sessionDirectory.lastPathComponent.isEmpty
+            && !projectDirectory.lastPathComponent.isEmpty
+    }
+
+    private func makeArchivedSessionCleanupPlan() -> ArchivedSessionCleanupPlan {
+        let sessionIds = archivedSessionIds(in: loadHarnessStorage(at: workspaceRegistryURL) ?? [:])
+        guard !sessionIds.isEmpty else { return .empty }
+
+        let directories = locateSessionDirectories(ids: Set(sessionIds))
+        let byteSize = directories.reduce(Int64(0)) { $0 + directoryByteSize(of: $1) }
+        return ArchivedSessionCleanupPlan(sessionIds: sessionIds, directories: directories, byteSize: byteSize)
+    }
+
+    private func formattedByteSize(_ byteSize: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: byteSize, countStyle: .file)
+    }
+
+    @objc private func purgeArchivedSessions(_ sender: Any?) {
+        let plan = makeArchivedSessionCleanupPlan()
+        guard !plan.isEmpty else {
+            presentAlert(
+                title: "没有已归档的会话",
+                detail: "先在工作台的会话列表里归档不再需要的对话，然后再回到这里清除它们的记录。",
+                style: .informational
+            )
+            return
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "清除 \(plan.sessionIds.count) 个已归档的会话？"
+        var detail = "官方 Harness 只把归档的会话从列表中隐藏，完整记录仍保存在 \(harnessHomeURL.path)。"
+        if plan.directories.isEmpty {
+            detail += "\n\n这些会话没有留下记录文件，只需清理列表中的残留条目。"
+        } else {
+            detail += "\n\n将有 \(plan.directories.count) 份会话记录（共 \(formattedByteSize(plan.byteSize))）移入废纸篓，可以从废纸篓恢复。"
+        }
+        detail += "\n\n内核会把会话列表常驻内存并回写，因此清除时会先停止再重启 Harness 内核；工作台里未发送的内容可能丢失。"
+        alert.informativeText = detail
+        alert.addButton(withTitle: "移入废纸篓并重启")
+        alert.addButton(withTitle: "取消")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.startArchivedSessionCleanup(plan)
+        }
+    }
+
+    private func startArchivedSessionCleanup(_ plan: ArchivedSessionCleanupPlan) {
+        if harnessWasStartedByThisApp, let process = harnessProcess, process.isRunning {
+            probeTimer?.invalidate()
+            probeTimer = nil
+            probeAttempts = 0
+            pendingArchivedSessionCleanup = plan
+            restartHarnessAfterTermination = true
+            harnessPageHasLoaded = false
+            webView.stopLoading()
+            showStartup(
+                status: "正在清除已归档的会话",
+                detail: "正在停止本机服务，随后移除 \(plan.sessionIds.count) 个会话的记录…",
+                isError: false
+            )
+            appendLog("Stopping Harness to remove \(plan.sessionIds.count) archived session(s).\n")
+            process.terminate()
+            return
+        }
+
+        probeHarness { [weak self] isReady in
+            guard let self else { return }
+            if isReady {
+                self.presentAlert(
+                    title: "请先停止外部 Harness 服务",
+                    detail: "当前 127.0.0.1:3080 的服务不是由此 App 启动，因此没有擅自终止它。内核会把会话列表常驻内存并回写，运行中删除会被它覆盖。请先停止那个服务，再重新执行清除。",
+                    style: .warning
+                )
+                return
+            }
+
+            let outcome = self.removeArchivedSessions(plan)
+            self.presentCleanupOutcome(outcome)
+        }
+    }
+
+    /// Removes the planned sessions from disk and from both storage files. Only sessions
+    /// whose transcript is gone lose their registry entries, so a directory that could not
+    /// be trashed stays visible in the workspace instead of becoming an orphaned file.
+    private func removeArchivedSessions(_ plan: ArchivedSessionCleanupPlan) -> ArchivedSessionCleanupOutcome {
+        var outcome = ArchivedSessionCleanupOutcome()
+        outcome.backupDirectory = backUpHarnessStorages()
+
+        var removedIds = Set(plan.sessionIds)
+        for directory in plan.directories {
+            let sessionId = directory.lastPathComponent
+            guard isRemovableSessionDirectory(directory) else {
+                removedIds.remove(sessionId)
+                outcome.failures.append("\(sessionId)：不在 \(harnessSessionsRootURL.path) 之内，已跳过。")
+                continue
+            }
+
+            let byteSize = directoryByteSize(of: directory)
+            do {
+                try FileManager.default.trashItem(at: directory, resultingItemURL: nil)
+                outcome.trashedDirectories += 1
+                outcome.freedBytes += byteSize
+            } catch {
+                removedIds.remove(sessionId)
+                outcome.failures.append("\(sessionId)：\(error.localizedDescription)")
+            }
+        }
+
+        guard !removedIds.isEmpty else { return outcome }
+
+        if let registry = loadHarnessStorage(at: workspaceRegistryURL) {
+            do {
+                try writeHarnessStorage(workspaceRegistry(registry, removingSessionIds: removedIds), to: workspaceRegistryURL)
+                outcome.removedRegistryEntries = removedIds.count
+            } catch {
+                outcome.failures.append("\(harnessWorkspaceRegistryFileName)：\(error.localizedDescription)")
+            }
+        }
+
+        if let cache = loadHarnessStorage(at: sessionCacheURL) {
+            do {
+                try writeHarnessStorage(sessionProjectionCache(cache, removingSessionIds: removedIds), to: sessionCacheURL)
+            } catch {
+                outcome.failures.append("\(harnessSessionCacheFileName)：\(error.localizedDescription)")
+            }
+        }
+
+        return outcome
+    }
+
+    /// Copies both storage files aside before they are rewritten, keeping the most recent
+    /// few. They are small, and a bad rewrite would otherwise cost the whole session list.
+    private func backUpHarnessStorages() -> URL? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+
+        let backupRoot = logURL.deletingLastPathComponent().appendingPathComponent("storage-backups", isDirectory: true)
+        let backupDirectory = backupRoot.appendingPathComponent(formatter.string(from: Date()), isDirectory: true)
+
+        do {
+            try FileManager.default.createDirectory(at: backupDirectory, withIntermediateDirectories: true)
+            for source in [workspaceRegistryURL, sessionCacheURL] {
+                guard FileManager.default.fileExists(atPath: source.path) else { continue }
+                let destination = backupDirectory.appendingPathComponent(source.lastPathComponent, isDirectory: false)
+                try? FileManager.default.removeItem(at: destination)
+                try FileManager.default.copyItem(at: source, to: destination)
+            }
+        } catch {
+            return nil
+        }
+
+        pruneHarnessStorageBackups(in: backupRoot)
+        return backupDirectory
+    }
+
+    private func pruneHarnessStorageBackups(in backupRoot: URL) {
+        guard let backups = try? FileManager.default.contentsOfDirectory(
+            at: backupRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        let sorted = backups
+            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        guard sorted.count > harnessStorageBackupLimit else { return }
+
+        for obsolete in sorted.prefix(sorted.count - harnessStorageBackupLimit) {
+            try? FileManager.default.removeItem(at: obsolete)
+        }
+    }
+
+    private func cleanupLogLine(for outcome: ArchivedSessionCleanupOutcome) -> String {
+        var line = "Archived session cleanup: trashed \(outcome.trashedDirectories) transcript(s), "
+        line += "freed \(outcome.freedBytes) bytes, removed \(outcome.removedRegistryEntries) registry entr(y/ies)."
+        if !outcome.failures.isEmpty {
+            line += " Failures: \(outcome.failures.joined(separator: "; "))"
+        }
+        return line + "\n"
+    }
+
+    private func presentCleanupOutcome(_ outcome: ArchivedSessionCleanupOutcome) {
+        var detail = outcome.trashedDirectories > 0
+            ? "已把 \(outcome.trashedDirectories) 份会话记录（共 \(formattedByteSize(outcome.freedBytes))）移入废纸篓，可以从废纸篓恢复。"
+            : "没有需要移入废纸篓的记录文件。"
+        if outcome.removedRegistryEntries > 0 {
+            detail += "\n工作台列表中的 \(outcome.removedRegistryEntries) 个条目也已清除。"
+        }
+        if let backupDirectory = outcome.backupDirectory {
+            detail += "\n\n改动前的列表数据已备份到：\n\(backupDirectory.path)"
+        }
+
+        if outcome.failures.isEmpty {
+            presentAlert(title: "已清除归档会话", detail: detail, style: .informational)
+            return
+        }
+
+        detail += "\n\n以下项目没有清除，仍保留在工作台中：\n" + outcome.failures.joined(separator: "\n")
+        presentAlert(title: "清除未完全完成", detail: detail, style: .warning)
+    }
+
     @objc private func reloadPage(_ sender: Any?) {
         if harnessPageHasLoaded {
             webView.reload()
@@ -1058,8 +1487,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
                     if self.restartHarnessAfterTermination {
                         self.restartHarnessAfterTermination = false
+                        let cleanup = self.pendingArchivedSessionCleanup
+                        self.pendingArchivedSessionCleanup = nil
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self] in
-                            self?.startHarnessProcess()
+                            guard let self else { return }
+                            // The kernel keeps both storage files in memory and rewrites them, so
+                            // the removal only sticks while no harness process is running.
+                            let outcome = cleanup.map { self.removeArchivedSessions($0) }
+                            self.startHarnessProcess()
+                            if let outcome {
+                                self.appendLog(self.cleanupLogLine(for: outcome))
+                                self.presentCleanupOutcome(outcome)
+                            }
                         }
                         return
                     }
@@ -1498,8 +1937,80 @@ private func runSelfTests() -> Int32 {
         "keep the current chrome inside the ambiguous luminance band"
     )
 
+
+    let temporaryHome = URL(fileURLWithPath: "/tmp/harness-self-test-home", isDirectory: true)
+    expect(
+        resolveHarnessHomeURL(environment: [:], home: temporaryHome).path == "/tmp/harness-self-test-home/.dsh",
+        "default the harness home to ~/.dsh"
+    )
+    expect(
+        resolveHarnessHomeURL(environment: ["DSH_HOME": "   "], home: temporaryHome).path == "/tmp/harness-self-test-home/.dsh",
+        "treat a blank DSH_HOME as unset"
+    )
+    expect(
+        resolveHarnessHomeURL(environment: ["DSH_HOME": "~/harness-data"], home: temporaryHome).path
+            == "/tmp/harness-self-test-home/harness-data",
+        "expand a tilde in DSH_HOME"
+    )
+    expect(
+        resolveHarnessHomeURL(environment: ["DSH_HOME": "/srv/dsh"], home: temporaryHome).path == "/srv/dsh",
+        "honour an absolute DSH_HOME"
+    )
+
+    let registry: [String: Any] = [
+        "unit": ["name": "workspace", "version": 2],
+        "global": [
+            "initialized": true,
+            "workspaceIds": ["workspace-a"],
+            "archivedSessionIds": ["session-1", "session-1", "session-2", 7]
+        ],
+        "tables": [
+            "workspaces": [
+                "workspace-a": [
+                    "path": "/tmp/project",
+                    "title": "project",
+                    "sessionIds": ["session-1", "session-2", "session-3"]
+                ]
+            ]
+        ]
+    ]
+
+    expect(archivedSessionIds(in: registry) == ["session-1", "session-2"], "read archived ids without duplicates or non-strings")
+    expect(archivedSessionIds(in: [:]).isEmpty, "tolerate a registry without an archive set")
+
+    let prunedRegistry = workspaceRegistry(registry, removingSessionIds: ["session-1"])
+    let prunedGlobal = prunedRegistry["global"] as? [String: Any]
+    let prunedArchived = prunedGlobal?["archivedSessionIds"] as? [Any]
+    let prunedWorkspaces = (prunedRegistry["tables"] as? [String: Any])?["workspaces"] as? [String: Any]
+    let prunedWorkspace = prunedWorkspaces?["workspace-a"] as? [String: Any]
+    expect(prunedArchived?.compactMap { $0 as? String } == ["session-2"], "drop the removed id from the archive set")
+    expect(prunedArchived?.count == 2, "keep registry entries the launcher does not understand")
+    expect(
+        (prunedWorkspace?["sessionIds"] as? [Any])?.compactMap { $0 as? String } == ["session-2", "session-3"],
+        "drop the removed id from its workspace"
+    )
+    expect(prunedWorkspace?["path"] as? String == "/tmp/project", "preserve unrelated workspace fields")
+    expect((prunedRegistry["unit"] as? [String: Any])?["version"] as? Int == 2, "preserve the storage unit header")
+    expect(
+        (workspaceRegistry(registry, removingSessionIds: [])["global"] as? [String: Any])
+            .flatMap { ($0["archivedSessionIds"] as? [Any])?.count } == 4,
+        "leave the registry untouched when nothing is removed"
+    )
+
+    let cache: [String: Any] = [
+        "unit": ["name": "session_projcache", "version": 3],
+        "tables": ["sessions": ["session-1": ["rows": [:]], "session-2": ["rows": [:]]]]
+    ]
+    let prunedCache = sessionProjectionCache(cache, removingSessionIds: ["session-1"])
+    let prunedSessions = (prunedCache["tables"] as? [String: Any])?["sessions"] as? [String: Any]
+    expect(prunedSessions?.count == 1 && prunedSessions?["session-2"] != nil, "drop only the removed session from the cache")
+    expect(
+        ((sessionProjectionCache([:], removingSessionIds: ["session-1"])) as NSDictionary).count == 0,
+        "tolerate a cache without a sessions table"
+    )
+
     if failures.isEmpty {
-        print("Self-test passed: semantic versioning, official dist-tag selection and chrome luminance")
+        print("Self-test passed: semantic versioning, official dist-tag selection, chrome luminance and archived session cleanup")
         return 0
     }
 

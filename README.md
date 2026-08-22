@@ -4,7 +4,7 @@
 <p align="center">非官方启动器 · 独立窗口 · 本机工作区</p>
 
 <p align="center">
-  <a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.6.0/DeepSeek-Harness-v2.6.0-macOS-arm64.dmg"><strong>↓ 下载 v2.6.0</strong></a>
+  <a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.7.0/DeepSeek-Harness-v2.7.0-macOS-arm64.dmg"><strong>↓ 下载 v2.7.0</strong></a>
 </p>
 <p align="center">
   <a href="./INSTALL.md">安装说明</a>
@@ -14,7 +14,7 @@
 <p align="center">Apple Silicon · macOS 12+ · Node.js 22.19–22.x 或 24.0+（不支持 23.x）</p>
 
 > [!WARNING]
-> **v2.6.0 尚未公证。** 首次打开：在访达中右键 App → **打开** → 再确认；不要关闭 Gatekeeper。
+> **v2.7.0 尚未公证。** 首次打开：在访达中右键 App → **打开** → 再确认；不要关闭 Gatekeeper。
 
 <p align="center">
   <picture>
@@ -32,8 +32,25 @@
 - **原生窗口交互**：拖动标题栏移动窗口；`Command +` / `Command -` 调整字体，`Command 0` 恢复默认大小。
 - **没有浏览器痕迹**：标题栏与工作台背景融为一体并跟随明暗主题；右键只保留原生编辑命令，控件不再出现网页手型光标与文字选中，整页橡皮筋回弹和网页滚动条也一并去掉。
 - **一键检查内核更新**：从 App 菜单读取 npm 官方 `latest` / `next`，自动选择更高版本；每次切换都会记录旧版本，随时可以回退到上一版。
+- **归档的会话可以真正删除**：官方内核只把会话隐藏，启动器可以把这些记录移入废纸篓，并同时清干净侧边栏里的残留条目。
 - **服务留在本机**：Harness Web UI 仅监听 `127.0.0.1:3080`。
 - **工作区由你选择**：使用隔离的默认目录，或切换到自己的项目文件夹。
+
+## v2.7.0 重点更新：归档之后，可以真正删除
+
+官方 Harness 的会话列表只提供归档：会话从侧边栏消失，但完整记录仍然留在 `~/.dsh/sessions` 里，一个字节都没少。想腾出空间、或者让某段对话真正消失，就只能自己去翻目录。
+
+v2.7.0 把这最后一步交给启动器。App 菜单里多了一项 **清除已归档的会话…（N 个）**：
+
+- 标题里直接写明有多少个可清；没有归档会话时置灰，不会出现点了等于没点的情况。
+- 确认框先算清楚这次会清掉几个会话、多少体积，确认之后才动手。
+- 会话记录**移入废纸篓**而不是直接抹掉，误清可以拖回来。
+- 同时清理 `workspace.json` 的归档集合与工作区成员，以及 `session_projcache.json` 的标题和统计缓存，侧边栏不留残影。
+- 改写这两个列表文件前自动备份到 `~/Library/Logs/DeepSeek Harness/storage-backups/`，只保留最近 5 份。
+
+内核会把会话列表常驻内存并回写，所以清除时会先停止再重启 Harness 内核；工作台里未发送的内容可能丢失。如果 `127.0.0.1:3080` 是你在终端里启动的服务，启动器只提示你先停掉它，不会擅自终止外部进程。
+
+删除范围也画得很死：只动 `<DSH_HOME>/sessions/<项目>/<会话>` 这一层，路径形状不符即跳过并报告；某个目录没能移入废纸篓时保留它的列表条目，不会产生看不见的孤儿记录。子代理会话记录不参与清除，因为父子关系只存在于 zstd 压缩的日志头内，启动器不做猜测。
 
 ## v2.6.0 重点更新：内核回退，一次退一步
 
@@ -78,7 +95,7 @@ Harness 的工作台本质仍由官方 Web UI 提供，macOS 启动器继续使�
 
 ## 三步安装
 
-1. [下载 v2.6.0 DMG](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.6.0/DeepSeek-Harness-v2.6.0-macOS-arm64.dmg)，打开后把 **DeepSeek Harness.app** 拖入 **Applications**。
+1. [下载 v2.7.0 DMG](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.7.0/DeepSeek-Harness-v2.7.0-macOS-arm64.dmg)，打开后把 **DeepSeek Harness.app** 拖入 **Applications**。
 2. 在“应用程序”中右键 App，选择 **打开**，然后在 macOS 提示中再次确认。
 3. 首次启动时确认通过 `npx` 获取默认版本的官方 `@deepseek-ai/dsh@0.1.0-rc.6`，等待工作台出现。
 
@@ -125,6 +142,7 @@ Harness 的工作台本质仍由官方 Web UI 提供，macOS 启动器继续使�
 - 模型凭据由官方 Harness 管理；启动器自身不存储或迁移 API Key。
 - Web UI 只监听本机，但模型请求仍会发送给你配置的 Provider。
 - 外接盘建议使用 APFS；exFAT 可能因受保护写入能力不足出现 `ENOTSUP`。
+- 会话记录由官方 Harness 保存在 `$DSH_HOME/sessions`（默认 `~/.dsh/sessions`）；归档只是隐藏，可用菜单里的「清除已归档的会话…」把它们移入废纸篓。
 - 启动日志位于 `~/Library/Logs/DeepSeek Harness/harness-web.log`。
 
 <details>
@@ -168,11 +186,11 @@ Harness 的工作台本质仍由官方 Web UI 提供，macOS 启动器继续使�
 <details>
 <summary><strong>验证下载文件与本地构建</strong></summary>
 
-下载 [SHA-256 文件](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.6.0/DeepSeek-Harness-v2.6.0-macOS-arm64.dmg.sha256) 后，在终端运行：
+下载 [SHA-256 文件](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.7.0/DeepSeek-Harness-v2.7.0-macOS-arm64.dmg.sha256) 后，在终端运行：
 
 ```sh
 cd ~/Downloads
-shasum -a 256 -c DeepSeek-Harness-v2.6.0-macOS-arm64.dmg.sha256
+shasum -a 256 -c DeepSeek-Harness-v2.7.0-macOS-arm64.dmg.sha256
 ```
 
 本地构建与验证：
@@ -189,4 +207,4 @@ shasum -a 256 -c DeepSeek-Harness-v2.6.0-macOS-arm64.dmg.sha256
 
 ---
 
-<p align="center"><sub><a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/tag/v2.6.0">v2.6.0</a> · <a href="./CHANGELOG.md">更新历史</a> · DSH 0.1.0-rc.6 · arm64 · <a href="./LICENSE">MIT</a> · <a href="./NOTICE.md">NOTICE</a> · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/issues">Issues</a></sub></p>
+<p align="center"><sub><a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/tag/v2.7.0">v2.7.0</a> · <a href="./CHANGELOG.md">更新历史</a> · DSH 0.1.0-rc.6 · arm64 · <a href="./LICENSE">MIT</a> · <a href="./NOTICE.md">NOTICE</a> · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/issues">Issues</a></sub></p>
