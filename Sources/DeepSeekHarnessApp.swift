@@ -4,9 +4,11 @@ import Foundation
 import WebKit
 
 private let appDisplayName = "DeepSeek Harness"
-private let harnessURL = URL(string: "http://127.0.0.1:3080/")!
+private let harnessBaseURL = URL(string: "http://127.0.0.1:3080/")!
 private let harnessPackageName = "@deepseek-ai/dsh"
-private let bundledHarnessPackageVersion = "0.1.0-rc.6"
+private let defaultHarnessPackageVersion = "0.1.2-alpha.3"
+private let verifiedFallbackHarnessPackageVersion = "0.1.1-rc.2"
+private let minimumRollbackHarnessPackageVersion = "0.1.0-rc.6"
 private let harnessDistTagsURL = URL(string: "https://registry.npmjs.org/-/package/%40deepseek-ai%2Fdsh/dist-tags")!
 private let harnessProjectURL = URL(string: "https://github.com/deepseek-ai/deepseek-harness")!
 private let maximumProbeAttempts = 180
@@ -232,8 +234,32 @@ private struct SemanticVersion: Comparable {
     }
 }
 
-private func newestOfficialHarnessVersion(in distTags: [String: String]) -> String? {
-    let candidates = [distTags["latest"], distTags["next"]]
+private enum HarnessUpdateChannel: String {
+    case defaultRelease = "default"
+    case alpha = "alpha"
+
+    var displayName: String {
+        switch self {
+        case .defaultRelease: return "默认（latest / next）"
+        case .alpha: return "Alpha 实验"
+        }
+    }
+
+    var candidateTags: [String] {
+        switch self {
+        case .defaultRelease: return ["latest", "next"]
+        // Include the default tags as well so an alpha user is offered a later
+        // stable release instead of remaining on a lower prerelease forever.
+        case .alpha: return ["latest", "next", "alpha"]
+        }
+    }
+}
+
+private func newestOfficialHarnessVersion(
+    in distTags: [String: String],
+    channel: HarnessUpdateChannel
+) -> String? {
+    let candidates = channel.candidateTags.map { distTags[$0] }
         .compactMap { $0 }
         .compactMap { rawValue -> (String, SemanticVersion)? in
             guard let version = SemanticVersion(rawValue) else { return nil }
@@ -243,12 +269,162 @@ private func newestOfficialHarnessVersion(in distTags: [String: String]) -> Stri
     return candidates.max { $0.1 < $1.1 }?.0
 }
 
+private struct HarnessOutputInspection {
+    let sanitizedLine: String
+    let authenticationURL: URL?
+}
+
+/// Redacts the process-scoped browser token defensively from every launcher log write.
+/// The raw token is only kept in memory long enough for WKWebView to exchange it for
+/// the official HttpOnly browser-session cookie.
+private func redactedHarnessLogText(_ text: String) -> String {
+    text.replacingOccurrences(
+        of: #"([?&]token=)[^&\s\"'<>]+"#,
+        with: "$1<redacted>",
+        options: .regularExpression
+    )
+}
+
+/// Accepts only the exact readiness line and local origin emitted by `dsh web`.
+/// A plugin or unrelated process cannot redirect the native window by printing an
+/// arbitrary URL into the shared process output stream.
+private func inspectHarnessOutputLine(_ line: String, expectedBaseURL: URL) -> HarnessOutputInspection {
+    let sanitized = redactedHarnessLogText(line)
+    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+    let prefix = "dsh web: "
+    guard trimmed.hasPrefix(prefix) else {
+        return HarnessOutputInspection(sanitizedLine: sanitized, authenticationURL: nil)
+    }
+
+    let rawURL = String(trimmed.dropFirst(prefix.count))
+    guard let url = URL(string: rawURL),
+          let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+          url.scheme?.lowercased() == expectedBaseURL.scheme?.lowercased(),
+          url.host?.lowercased() == expectedBaseURL.host?.lowercased(),
+          url.port == expectedBaseURL.port,
+          url.user == nil,
+          url.password == nil,
+          url.fragment == nil,
+          url.path == expectedBaseURL.path else {
+        return HarnessOutputInspection(sanitizedLine: sanitized, authenticationURL: nil)
+    }
+
+    let tokenItems = (components.queryItems ?? []).filter { $0.name == "token" }
+    guard tokenItems.count == 1,
+          (components.queryItems ?? []).count == 1,
+          let token = tokenItems[0].value,
+          token.range(of: #"^[A-Za-z0-9_-]{43}$"#, options: .regularExpression) != nil else {
+        return HarnessOutputInspection(sanitizedLine: sanitized, authenticationURL: nil)
+    }
+
+    return HarnessOutputInspection(sanitizedLine: sanitized, authenticationURL: url)
+}
+
+private enum HarnessProbeResult: Equatable {
+    case ready
+    case authenticationRequired
+    case occupiedUnknown
+    case unavailable
+}
+
+/// Drains the child process continuously on a private serial queue. Raw bytes are
+/// buffered until a newline before UTF-8 decoding, so a multibyte log character split
+/// across pipe chunks cannot drop the following readiness URL. All writes to the shared
+/// log handle also pass through this queue while the process is alive.
+private final class HarnessProcessOutputRelay {
+    let pipe = Pipe()
+
+    private let queue = DispatchQueue(label: "com.flyx.deepseek-harness.output-relay")
+    private let logHandle: FileHandle
+    private let expectedBaseURL: URL
+    private var buffer = Data()
+    private var capturedAuthenticationURL: URL?
+
+    init(logHandle: FileHandle, expectedBaseURL: URL) {
+        self.logHandle = logHandle
+        self.expectedBaseURL = expectedBaseURL
+    }
+
+    func attach(to process: Process) {
+        process.standardOutput = pipe
+        process.standardError = pipe
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            self?.queue.async {
+                self?.consume(data)
+            }
+        }
+    }
+
+    func appendLog(_ text: String) {
+        queue.async { [weak self] in
+            self?.write(redactedHarnessLogText(text))
+        }
+    }
+
+    func authenticationURL() -> URL? {
+        queue.sync { capturedAuthenticationURL }
+    }
+
+    /// Call only after the child has exited, so reading to EOF cannot block.
+    func closeAfterProcessExit() {
+        pipe.fileHandleForReading.readabilityHandler = nil
+        let remaining = pipe.fileHandleForReading.readDataToEndOfFile()
+        queue.sync {
+            consume(remaining)
+            flush()
+        }
+    }
+
+    func invalidateWithoutDraining() {
+        pipe.fileHandleForReading.readabilityHandler = nil
+        queue.sync { flush() }
+    }
+
+    private func consume(_ data: Data) {
+        guard !data.isEmpty else {
+            flush()
+            return
+        }
+        buffer.append(data)
+
+        while let newline = buffer.firstIndex(of: 0x0A) {
+            let lineData = buffer[..<newline]
+            buffer.removeSubrange(...newline)
+            handleLineData(Data(lineData))
+        }
+    }
+
+    private func flush() {
+        guard !buffer.isEmpty else { return }
+        let lineData = buffer
+        buffer.removeAll(keepingCapacity: false)
+        handleLineData(lineData)
+    }
+
+    private func handleLineData(_ data: Data) {
+        let line = String(decoding: data, as: UTF8.self)
+        let inspection = inspectHarnessOutputLine(line, expectedBaseURL: expectedBaseURL)
+        if let authenticationURL = inspection.authenticationURL {
+            capturedAuthenticationURL = authenticationURL
+        }
+        write(inspection.sanitizedLine + "\n")
+    }
+
+    private func write(_ text: String) {
+        guard let data = text.data(using: .utf8) else { return }
+        try? logHandle.write(contentsOf: data)
+    }
+}
+
 private let dshHomeEnvironmentKey = "DSH_HOME"
 private let dshHomeDirectoryName = ".dsh"
 private let harnessSessionsDirectoryName = "sessions"
 private let harnessStoragesDirectoryName = "storages"
 private let harnessWorkspaceRegistryFileName = "workspace.json"
-private let harnessSessionCacheFileName = "session_projcache.json"
+private let legacyHarnessSessionCacheFileName = "session_projcache.json"
+private let harnessSessionCacheDirectoryName = "session_projcache"
+private let harnessSessionCacheRecordsDirectoryName = "sessions"
 private let harnessStorageBackupLimit = 5
 
 /// Expands the tilde prefixes the official harness accepts in `$DSH_HOME`.
@@ -342,17 +518,111 @@ private func sessionProjectionCache(_ cache: [String: Any], removingSessionIds i
     return updated
 }
 
+private func storageUnit(_ storage: [String: Any], matchesName name: String, version: Int) -> Bool {
+    guard let unit = storage["unit"] as? [String: Any],
+          unit["name"] as? String == name,
+          let storedVersion = unit["version"] as? NSNumber,
+          storedVersion.doubleValue == Double(version) else { return false }
+    return true
+}
+
+private func isRegularFileWithoutSymlinks(_ url: URL) -> Bool {
+    let file = url.standardizedFileURL
+    guard file.resolvingSymlinksInPath().path == file.path,
+          let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else {
+        return false
+    }
+    return values.isRegularFile == true && values.isSymbolicLink != true
+}
+
+private struct ProjectionCacheRecordScan {
+    let records: [URL]
+    let failures: [String]
+
+    static let empty = ProjectionCacheRecordScan(records: [], failures: [])
+}
+
+private func scanProjectionCacheRecords(
+    in root: URL,
+    matching ids: Set<String>,
+    fileManager: FileManager = .default
+) -> ProjectionCacheRecordScan {
+    let standardizedRoot = root.standardizedFileURL
+    guard fileManager.fileExists(atPath: standardizedRoot.path) else { return .empty }
+    guard standardizedRoot.resolvingSymlinksInPath().path == standardizedRoot.path,
+          let rootValues = try? standardizedRoot.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+          rootValues.isDirectory == true,
+          rootValues.isSymbolicLink != true else {
+        return ProjectionCacheRecordScan(records: [], failures: ["session_projcache/sessions 不是安全的真实目录"])
+    }
+    guard let candidates = try? fileManager.contentsOfDirectory(
+        at: standardizedRoot,
+        includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+        options: [.skipsHiddenFiles]
+    ) else {
+        return ProjectionCacheRecordScan(records: [], failures: ["无法读取 session_projcache/sessions"])
+    }
+
+    var records: [URL] = []
+    var failures: [String] = []
+    for record in candidates {
+        guard record.pathExtension == "json",
+              ids.contains(record.deletingPathExtension().lastPathComponent) else { continue }
+        let standardized = record.standardizedFileURL
+        guard standardized.deletingLastPathComponent().path == standardizedRoot.path,
+              standardized.resolvingSymlinksInPath().path == standardized.path,
+              let values = try? standardized.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+              values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              projectionCacheRecordIsVersion4(standardized) else {
+            failures.append("\(record.lastPathComponent)：不是受支持的普通 v4 投影缓存文件")
+            continue
+        }
+        records.append(standardized)
+    }
+    return ProjectionCacheRecordScan(
+        records: records.sorted { $0.path < $1.path },
+        failures: failures.sorted()
+    )
+}
+
+private func projectionCacheRecordIsVersion4(_ url: URL) -> Bool {
+    guard let data = try? Data(contentsOf: url),
+          let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let version = document["version"] as? NSNumber,
+          version.doubleValue == 4,
+          document["record"] is [String: Any] else { return false }
+    return true
+}
+
 /// What one cleanup would remove, measured before the user is asked to confirm.
 private struct ArchivedSessionCleanupPlan {
     let sessionIds: [String]
     /// Transcript directories that exist on disk. Archived sessions that never wrote a
     /// transcript have no directory and only leave registry entries behind.
     let directories: [URL]
+    /// Alpha.3 stores each derived projection cache record in its own JSON file.
+    /// These are backed up and removed together with the authoritative transcript.
+    let projectionCacheRecords: [URL]
+    let validationFailures: [String]
     let byteSize: Int64
 
-    static let empty = ArchivedSessionCleanupPlan(sessionIds: [], directories: [], byteSize: 0)
+    static let empty = ArchivedSessionCleanupPlan(
+        sessionIds: [],
+        directories: [],
+        projectionCacheRecords: [],
+        validationFailures: [],
+        byteSize: 0
+    )
 
     var isEmpty: Bool { sessionIds.isEmpty }
+    var isValid: Bool { validationFailures.isEmpty }
+}
+
+private struct TrashedPathMove {
+    let originalURL: URL
+    let trashURL: URL
+    let byteSize: Int64
 }
 
 /// What one cleanup actually removed, reported back to the user afterwards.
@@ -360,6 +630,7 @@ private struct ArchivedSessionCleanupOutcome {
     var trashedDirectories = 0
     var freedBytes: Int64 = 0
     var removedRegistryEntries = 0
+    var removedProjectionCacheRecords = 0
     var backupDirectory: URL?
     var failures: [String] = []
 }
@@ -398,6 +669,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var retryButton: NSButton!
     private var logButton: NSButton!
     private var harnessVersionMenuItem: NSMenuItem!
+    private var harnessRunningVersionMenuItem: NSMenuItem!
+    private var harnessUpdateChannelMenuItem: NSMenuItem!
     private var checkHarnessUpdateMenuItem: NSMenuItem!
     private var rollBackHarnessMenuItem: NSMenuItem!
     private var purgeArchivedSessionsMenuItem: NSMenuItem!
@@ -407,7 +680,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private var probeInFlight = false
     private var harnessProcess: Process?
     private var harnessLogHandle: FileHandle?
+    private var harnessOutputRelay: HarnessProcessOutputRelay?
+    private var pendingHarnessAuthenticationURL: URL?
+    private var validatedMainFrameHarnessResponse = false
     private var harnessWasStartedByThisApp = false
+    private var activeOwnedHarnessVersion: String?
     private var restartHarnessAfterTermination = false
     private var isTerminating = false
     private var harnessPageHasLoaded = false
@@ -417,6 +694,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private let packageApprovalDefaultsKey = "ApprovedOfficialHarnessPackageDownload"
     private let harnessVersionDefaultsKey = "SelectedOfficialHarnessPackageVersion"
     private let harnessVersionHistoryDefaultsKey = "OfficialHarnessPackageVersionHistory"
+    private let harnessUpdateChannelDefaultsKey = "OfficialHarnessUpdateChannel"
+    private let lastKnownGoodHarnessVersionDefaultsKey = "LastKnownGoodOfficialHarnessPackageVersion"
     private let harnessVersionHistoryLimit = 10
     private let pageZoomDefaultsKey = "HarnessPageZoom"
     private let minimumPageZoom: CGFloat = 0.75
@@ -429,6 +708,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private lazy var workspaceURL: URL = resolveWorkspaceURL()
     private lazy var selectedHarnessPackageVersion: String = resolveSelectedHarnessPackageVersion()
     private lazy var harnessPackageVersionHistory: [String] = resolveHarnessPackageVersionHistory()
+    private lazy var harnessUpdateChannel: HarnessUpdateChannel = resolveHarnessUpdateChannel()
+    private lazy var lastKnownGoodHarnessPackageVersion: String = resolveLastKnownGoodHarnessPackageVersion()
+    private var pendingHarnessSwitchFromVersion: String?
+    private var isAutomaticHarnessRollback = false
+    private var isHarnessTransitionInProgress = false
     private var previousHarnessPackageVersion: String? {
         harnessPackageVersionHistory.last
     }
@@ -499,6 +783,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             process.terminate()
         }
 
+        closeHarnessOutputCapture()
         closeHarnessLogHandle()
     }
 
@@ -680,9 +965,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         revealWorkspaceItem.target = self
         appMenu.addItem(revealWorkspaceItem)
         appMenu.addItem(.separator())
-        harnessVersionMenuItem = NSMenuItem(title: "Harness 内核：\(selectedHarnessPackageVersion)", action: nil, keyEquivalent: "")
+        harnessVersionMenuItem = NSMenuItem(title: "已选内核：\(selectedHarnessPackageVersion)", action: nil, keyEquivalent: "")
         harnessVersionMenuItem.isEnabled = false
         appMenu.addItem(harnessVersionMenuItem)
+        harnessRunningVersionMenuItem = NSMenuItem(title: "运行内核：尚未连接", action: nil, keyEquivalent: "")
+        harnessRunningVersionMenuItem.isEnabled = false
+        appMenu.addItem(harnessRunningVersionMenuItem)
+        harnessUpdateChannelMenuItem = NSMenuItem(
+            title: "使用 Alpha 实验更新通道",
+            action: #selector(toggleHarnessUpdateChannel(_:)),
+            keyEquivalent: ""
+        )
+        harnessUpdateChannelMenuItem.target = self
+        appMenu.addItem(harnessUpdateChannelMenuItem)
         checkHarnessUpdateMenuItem = NSMenuItem(title: "检查并更新 Harness 内核…", action: #selector(checkForHarnessUpdate(_:)), keyEquivalent: "")
         checkHarnessUpdateMenuItem.target = self
         appMenu.addItem(checkHarnessUpdateMenuItem)
@@ -767,10 +1062,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
     @objc private func showAbout(_ sender: Any?) {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.0"
+        let runningVersion = harnessWasStartedByThisApp
+            ? (activeOwnedHarnessVersion ?? "正在启动")
+            : (harnessPageHasLoaded ? "外部服务（版本未知）" : "尚未连接")
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: appDisplayName,
             .applicationVersion: version,
-            .version: "非官方原生窗口版 · Harness \(selectedHarnessPackageVersion)",
+            .version: "非官方原生窗口版 · 已选 \(selectedHarnessPackageVersion) · 运行 \(runningVersion)",
             .credits: NSAttributedString(
                 string: "独立制作的非官方 macOS 启动器，与 DeepSeek 无隶属、赞助或官方背书关系。\n仅连接本机 127.0.0.1:3080；图标为原创，并非 DeepSeek 官方 Logo。"
             )
@@ -815,26 +1113,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem === checkHarnessUpdateMenuItem {
-            return !isCheckingForHarnessUpdate
+            return !isCheckingForHarnessUpdate && !isHarnessTransitionInProgress
+        }
+        if menuItem === harnessUpdateChannelMenuItem {
+            return !isCheckingForHarnessUpdate && !isHarnessTransitionInProgress
         }
         if menuItem === rollBackHarnessMenuItem {
-            return !isCheckingForHarnessUpdate && previousHarnessPackageVersion != nil
+            return !isCheckingForHarnessUpdate && !isHarnessTransitionInProgress && previousHarnessPackageVersion != nil
         }
         if menuItem === purgeArchivedSessionsMenuItem {
             // Reading only the registry keeps this cheap enough to run each time the menu opens;
             // transcript sizes are measured later, once the user asks for the cleanup itself.
             let archivedCount = archivedSessionIds(in: loadHarnessStorage(at: workspaceRegistryURL) ?? [:]).count
             menuItem.title = purgeArchivedSessionsMenuItemTitle(count: archivedCount)
-            return archivedCount > 0
+            return !isHarnessTransitionInProgress && archivedCount > 0
         }
         return true
     }
 
     private func refreshHarnessVersionMenuItems() {
-        harnessVersionMenuItem?.title = "Harness 内核：\(selectedHarnessPackageVersion)"
+        harnessVersionMenuItem?.title = "已选内核：\(selectedHarnessPackageVersion)"
+        if harnessWasStartedByThisApp, let activeOwnedHarnessVersion {
+            harnessRunningVersionMenuItem?.title = "运行内核：\(activeOwnedHarnessVersion)（本 App）"
+        } else if harnessPageHasLoaded {
+            harnessRunningVersionMenuItem?.title = "运行内核：外部服务（版本未知）"
+        } else {
+            harnessRunningVersionMenuItem?.title = "运行内核：尚未连接"
+        }
+        harnessUpdateChannelMenuItem?.state = harnessUpdateChannel == .alpha ? .on : .off
         checkHarnessUpdateMenuItem?.title = isCheckingForHarnessUpdate
             ? "正在检查官方更新…"
-            : "检查并更新 Harness 内核…"
+            : "检查\(harnessUpdateChannel.displayName)通道更新…"
         rollBackHarnessMenuItem?.title = rollBackHarnessMenuItemTitle
         rollBackHarnessMenuItem?.isEnabled = previousHarnessPackageVersion != nil
         NSApp.mainMenu?.update()
@@ -847,10 +1156,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         return "回退到上一版内核 \(previousVersion)"
     }
 
+    @objc private func toggleHarnessUpdateChannel(_ sender: Any?) {
+        guard !isCheckingForHarnessUpdate else { return }
+
+        if harnessUpdateChannel == .alpha {
+            setHarnessUpdateChannel(.defaultRelease)
+            return
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "启用 Alpha 实验更新通道？"
+        alert.informativeText = "Alpha 版本可能包含破坏兼容性的变化。回退可以恢复旧执行版本，但不能自动逆转官方内核已经写入的数据格式变化。\n\n0.1.2-alpha.3 已移除可选 SQLite Session 后端；使用自定义 SQLite Profile 时应先在旧版导出。"
+        alert.addButton(withTitle: "启用 Alpha 通道")
+        alert.addButton(withTitle: "取消")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else { return }
+            self?.setHarnessUpdateChannel(.alpha)
+        }
+    }
+
+    private func setHarnessUpdateChannel(_ channel: HarnessUpdateChannel) {
+        harnessUpdateChannel = channel
+        UserDefaults.standard.set(channel.rawValue, forKey: harnessUpdateChannelDefaultsKey)
+        refreshHarnessVersionMenuItems()
+    }
+
     @objc private func checkForHarnessUpdate(_ sender: Any?) {
         guard !isCheckingForHarnessUpdate else { return }
         isCheckingForHarnessUpdate = true
         refreshHarnessVersionMenuItems()
+        let requestedChannel = harnessUpdateChannel
 
         var request = URLRequest(url: harnessDistTagsURL)
         request.httpMethod = "GET"
@@ -876,12 +1212,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             }
 
             DispatchQueue.main.async {
-                self?.finishHarnessUpdateCheck(result)
+                self?.finishHarnessUpdateCheck(result, channel: requestedChannel)
             }
         }.resume()
     }
 
-    private func finishHarnessUpdateCheck(_ result: Result<[String: String], Error>) {
+    private func finishHarnessUpdateCheck(
+        _ result: Result<[String: String], Error>,
+        channel: HarnessUpdateChannel
+    ) {
         isCheckingForHarnessUpdate = false
         refreshHarnessVersionMenuItems()
 
@@ -893,12 +1232,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                 style: .warning
             )
         case let .success(distTags):
-            guard let newestVersion = newestOfficialHarnessVersion(in: distTags),
+            guard let newestVersion = newestOfficialHarnessVersion(in: distTags, channel: channel),
                   let newestSemanticVersion = SemanticVersion(newestVersion),
                   let selectedSemanticVersion = SemanticVersion(selectedHarnessPackageVersion) else {
                 presentAlert(
                     title: "无法识别官方版本",
-                    detail: HarnessUpdateError.invalidMetadata.localizedDescription,
+                    detail: "npm 官方版本信息中没有可用于\(channel.displayName)通道的合法版本。",
                     style: .warning
                 )
                 return
@@ -907,16 +1246,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             guard selectedSemanticVersion < newestSemanticVersion else {
                 presentAlert(
                     title: "Harness 内核已是最新",
-                    detail: "当前选择：\(selectedHarnessPackageVersion)\n官方最新：\(newestVersion)",
+                    detail: "当前选择：\(selectedHarnessPackageVersion)\n\(channel.displayName)通道最新：\(newestVersion)",
                     style: .informational
                 )
                 return
             }
 
             let alert = NSAlert()
-            alert.alertStyle = .informational
-            alert.messageText = "发现官方 Harness 内核更新"
-            alert.informativeText = "当前：\(selectedHarnessPackageVersion)\n新版：\(newestVersion)\n\n继续后将从 npm 官方注册表获取新版。Harness 仍处于 Developer Preview，新版可能包含不兼容变化；你可以随时从 App 菜单回退到上一版 \(selectedHarnessPackageVersion)。"
+            alert.alertStyle = channel == .alpha ? .warning : .informational
+            alert.messageText = channel == .alpha
+                ? "发现官方 Harness Alpha 更新"
+                : "发现官方 Harness 内核更新"
+            var detail = "当前：\(selectedHarnessPackageVersion)\n新版：\(newestVersion)\n更新通道：\(channel.displayName)"
+            detail += "\n\n继续后将从 npm 官方注册表获取新版。Harness 仍处于 Developer Preview，新版可能包含不兼容变化；可以从 App 菜单回退到上一版 \(selectedHarnessPackageVersion)。"
+            if channel == .alpha {
+                detail += "\n\n注意：版本回退不会自动逆转新版内核已经写入的数据格式变化。"
+            }
+            alert.informativeText = detail
             alert.addButton(withTitle: "更新并重启")
             alert.addButton(withTitle: "取消")
             alert.beginSheetModal(for: window) { [weak self] response in
@@ -967,10 +1313,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
         guard version != selectedHarnessPackageVersion else { return }
 
+        let previousVersion = selectedHarnessPackageVersion
         if recordingHistory {
-            recordHarnessPackageVersionInHistory(selectedHarnessPackageVersion)
+            recordHarnessPackageVersionInHistory(previousVersion)
         }
 
+        pendingHarnessSwitchFromVersion = previousVersion
+        isAutomaticHarnessRollback = false
         selectedHarnessPackageVersion = version
         UserDefaults.standard.set(version, forKey: harnessVersionDefaultsKey)
         UserDefaults.standard.set(true, forKey: packageApprovalDefaultsKey)
@@ -984,6 +1333,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         probeAttempts = 0
 
         if harnessWasStartedByThisApp, let process = harnessProcess, process.isRunning {
+            isHarnessTransitionInProgress = true
             restartHarnessAfterTermination = true
             harnessPageHasLoaded = false
             webView.stopLoading()
@@ -997,9 +1347,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             return
         }
 
-        probeHarness { [weak self] isReady in
+        probeHarness { [weak self] result in
             guard let self else { return }
-            if isReady {
+            if result != .unavailable {
+                // The external service keeps running unchanged. Reconstruct any
+                // future switch from the persisted last-known-good version when
+                // this App eventually owns the next launch.
+                self.pendingHarnessSwitchFromVersion = nil
+                self.isHarnessTransitionInProgress = false
                 self.presentAlert(
                     title: "新版内核已选择",
                     detail: "下次由此 App 启动 Harness 时，将使用 \(self.harnessPackageSpecifier)。\n\n当前 127.0.0.1:3080 服务不是由此 App 启动，因此没有擅自终止它。",
@@ -1019,11 +1374,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     private func resolveSelectedHarnessPackageVersion() -> String {
-        guard let bundledVersion = SemanticVersion(bundledHarnessPackageVersion),
+        guard let minimumVersion = SemanticVersion(minimumRollbackHarnessPackageVersion),
               let storedValue = UserDefaults.standard.string(forKey: harnessVersionDefaultsKey),
               let storedVersion = SemanticVersion(storedValue),
-              bundledVersion <= storedVersion else {
-            return bundledHarnessPackageVersion
+              minimumVersion <= storedVersion else {
+            return defaultHarnessPackageVersion
+        }
+        return storedValue
+    }
+
+    private func resolveHarnessUpdateChannel() -> HarnessUpdateChannel {
+        guard let rawValue = UserDefaults.standard.string(forKey: harnessUpdateChannelDefaultsKey),
+              let channel = HarnessUpdateChannel(rawValue: rawValue) else {
+            return .defaultRelease
+        }
+        return channel
+    }
+
+    private func resolveLastKnownGoodHarnessPackageVersion() -> String {
+        guard let minimumVersion = SemanticVersion(minimumRollbackHarnessPackageVersion),
+              let storedValue = UserDefaults.standard.string(forKey: lastKnownGoodHarnessVersionDefaultsKey),
+              let storedVersion = SemanticVersion(storedValue),
+              minimumVersion <= storedVersion else {
+            if selectedHarnessPackageVersion == verifiedFallbackHarnessPackageVersion {
+                return selectedHarnessPackageVersion
+            }
+            return verifiedFallbackHarnessPackageVersion
         }
         return storedValue
     }
@@ -1044,7 +1420,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     private func resolveHarnessPackageVersionHistory() -> [String] {
-        guard let bundledVersion = SemanticVersion(bundledHarnessPackageVersion),
+        guard let minimumVersion = SemanticVersion(minimumRollbackHarnessPackageVersion),
               let storedValues = UserDefaults.standard.array(forKey: harnessVersionHistoryDefaultsKey) as? [String] else {
             return []
         }
@@ -1052,13 +1428,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         var history: [String] = []
         for value in storedValues {
             guard let version = SemanticVersion(value),
-                  bundledVersion <= version,
+                  minimumVersion <= version,
                   value != selectedHarnessPackageVersion else { continue }
             history.removeAll { $0 == value }
             history.append(value)
         }
 
         return Array(history.suffix(harnessVersionHistoryLimit))
+    }
+
+    private func markOwnedHarnessReady() {
+        guard harnessWasStartedByThisApp,
+              let process = harnessProcess,
+              process.isRunning,
+              activeOwnedHarnessVersion == selectedHarnessPackageVersion else { return }
+        lastKnownGoodHarnessPackageVersion = selectedHarnessPackageVersion
+        UserDefaults.standard.set(selectedHarnessPackageVersion, forKey: lastKnownGoodHarnessVersionDefaultsKey)
+        pendingHarnessSwitchFromVersion = nil
+        isAutomaticHarnessRollback = false
+        isHarnessTransitionInProgress = false
+        refreshHarnessVersionMenuItems()
+    }
+
+    private func recoverFromHarnessStartupFailure(_ reason: String) -> Bool {
+        guard !isAutomaticHarnessRollback,
+              let previousVersion = pendingHarnessSwitchFromVersion,
+              previousVersion != selectedHarnessPackageVersion,
+              SemanticVersion(previousVersion) != nil else { return false }
+
+        let failedVersion = selectedHarnessPackageVersion
+        isAutomaticHarnessRollback = true
+        isHarnessTransitionInProgress = true
+        pendingHarnessSwitchFromVersion = nil
+        harnessPackageVersionHistory.removeAll { $0 == previousVersion }
+        persistHarnessPackageVersionHistory()
+        selectedHarnessPackageVersion = previousVersion
+        UserDefaults.standard.set(previousVersion, forKey: harnessVersionDefaultsKey)
+        appendLog("Harness \(failedVersion) did not become ready; automatically restoring \(previousVersion). Reason: \(reason)\n")
+        refreshHarnessVersionMenuItems()
+
+        showStartup(
+            status: "新版启动失败，正在自动回退",
+            detail: "\(failedVersion) 未通过就绪验证。正在恢复 \(previousVersion)…",
+            isError: false
+        )
+
+        if let process = harnessProcess, process.isRunning {
+            restartHarnessAfterTermination = true
+            harnessPageHasLoaded = false
+            webView.stopLoading()
+            process.terminate()
+            return true
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self] in
+            self?.startHarnessProcess()
+        }
+        return true
     }
 
     private func presentAlert(title: String, detail: String, style: NSAlert.Style) {
@@ -1086,23 +1512,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             .appendingPathComponent(harnessWorkspaceRegistryFileName, isDirectory: false)
     }
 
-    private var sessionCacheURL: URL {
+    private var legacySessionCacheURL: URL {
         harnessHomeURL
             .appendingPathComponent(harnessStoragesDirectoryName, isDirectory: true)
-            .appendingPathComponent(harnessSessionCacheFileName, isDirectory: false)
+            .appendingPathComponent(legacyHarnessSessionCacheFileName, isDirectory: false)
+    }
+
+    private var sessionProjectionCacheRecordsRootURL: URL {
+        harnessHomeURL
+            .appendingPathComponent(harnessStoragesDirectoryName, isDirectory: true)
+            .appendingPathComponent(harnessSessionCacheDirectoryName, isDirectory: true)
+            .appendingPathComponent(harnessSessionCacheRecordsDirectoryName, isDirectory: true)
+            .standardizedFileURL
     }
 
     private func purgeArchivedSessionsMenuItemTitle(count: Int) -> String {
         count > 0 ? "清除已归档的会话…（\(count) 个）" : "清除已归档的会话…"
     }
 
+    private func isSafeRegularStorageFile(_ url: URL) -> Bool {
+        isRegularFileWithoutSymlinks(url)
+    }
+
     private func loadHarnessStorage(at url: URL) -> [String: Any]? {
-        guard let data = try? Data(contentsOf: url),
+        guard isSafeRegularStorageFile(url),
+              let data = try? Data(contentsOf: url),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return object
     }
 
     private func writeHarnessStorage(_ storage: [String: Any], to url: URL) throws {
+        guard isSafeRegularStorageFile(url) else { throw CocoaError(.fileWriteInvalidFileName) }
         let data = try JSONSerialization.data(withJSONObject: storage)
         try data.write(to: url, options: .atomic)
     }
@@ -1123,6 +1563,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         return total
     }
 
+    private func fileByteSize(of url: URL) -> Int64 {
+        guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileAllocatedSizeKey, .fileSizeKey]),
+              values.isRegularFile == true else { return 0 }
+        return Int64(values.fileAllocatedSize ?? values.fileSize ?? 0)
+    }
+
     /// Finds the transcript directories of the given sessions by scanning the project
     /// directories under the sessions root. The kernel escapes session ids into path
     /// segments, so matching what is on disk is safer than re-deriving the encoding here:
@@ -1131,22 +1577,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let root = harnessSessionsRootURL
         guard let projectDirectories = try? FileManager.default.contentsOfDirectory(
             at: root,
-            includingPropertiesForKeys: [.isDirectoryKey],
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
             options: [.skipsHiddenFiles]
         ) else { return [] }
 
         var located: [URL] = []
         for projectDirectory in projectDirectories {
-            guard (try? projectDirectory.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true,
+            guard let projectValues = try? projectDirectory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                  projectValues.isDirectory == true,
+                  projectValues.isSymbolicLink != true,
                   let sessionDirectories = try? FileManager.default.contentsOfDirectory(
                       at: projectDirectory,
-                      includingPropertiesForKeys: [.isDirectoryKey],
+                      includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
                       options: [.skipsHiddenFiles]
                   ) else { continue }
 
             for sessionDirectory in sessionDirectories {
                 guard ids.contains(sessionDirectory.lastPathComponent),
-                      (try? sessionDirectory.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { continue }
+                      let sessionValues = try? sessionDirectory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                      sessionValues.isDirectory == true,
+                      sessionValues.isSymbolicLink != true else { continue }
                 located.append(sessionDirectory.standardizedFileURL)
             }
         }
@@ -1157,18 +1607,104 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     private func isRemovableSessionDirectory(_ url: URL) -> Bool {
         let sessionDirectory = url.standardizedFileURL
         let projectDirectory = sessionDirectory.deletingLastPathComponent()
-        return projectDirectory.deletingLastPathComponent().path == harnessSessionsRootURL.path
+        guard let sessionValues = try? sessionDirectory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+              let projectValues = try? projectDirectory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else {
+            return false
+        }
+        return sessionValues.isDirectory == true
+            && sessionValues.isSymbolicLink != true
+            && projectValues.isDirectory == true
+            && projectValues.isSymbolicLink != true
+            && projectDirectory.deletingLastPathComponent().path == harnessSessionsRootURL.path
             && !sessionDirectory.lastPathComponent.isEmpty
             && !projectDirectory.lastPathComponent.isEmpty
     }
 
+    /// Finds only direct, regular, non-symlink v4 projection-cache records whose
+    /// filename stem exactly matches an archived session id. Session ids are never
+    /// interpolated into a deletion path.
+    private func locateProjectionCacheRecords(ids: Set<String>) -> ProjectionCacheRecordScan {
+        scanProjectionCacheRecords(in: sessionProjectionCacheRecordsRootURL, matching: ids)
+    }
+
+    private func isRemovableProjectionCacheRecord(_ url: URL) -> Bool {
+        let record = url.standardizedFileURL
+        guard record.deletingLastPathComponent().path == sessionProjectionCacheRecordsRootURL.path,
+              record.pathExtension == "json",
+              !record.deletingPathExtension().lastPathComponent.isEmpty,
+              let values = try? record.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else {
+            return false
+        }
+        return values.isRegularFile == true && values.isSymbolicLink != true
+            && projectionCacheRecordIsVersion4(record)
+    }
+
+    private func moveCleanupItemToTrash(_ url: URL, byteSize: Int64) throws -> TrashedPathMove {
+        var resultingURL: NSURL?
+        try FileManager.default.trashItem(at: url, resultingItemURL: &resultingURL)
+        guard let trashURL = resultingURL as URL? else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        return TrashedPathMove(
+            originalURL: url.standardizedFileURL,
+            trashURL: trashURL.standardizedFileURL,
+            byteSize: byteSize
+        )
+    }
+
+    private func restoreTrashedCleanupItems(
+        _ moves: [TrashedPathMove]
+    ) -> (restoredCount: Int, restoredBytes: Int64, failures: [String]) {
+        var restoredCount = 0
+        var restoredBytes: Int64 = 0
+        var failures: [String] = []
+
+        for move in moves.reversed() {
+            let originalParent = move.originalURL.deletingLastPathComponent().standardizedFileURL
+            guard !FileManager.default.fileExists(atPath: move.originalURL.path),
+                  originalParent.resolvingSymlinksInPath().path == originalParent.path,
+                  let parentValues = try? originalParent.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                  parentValues.isDirectory == true,
+                  parentValues.isSymbolicLink != true,
+                  FileManager.default.fileExists(atPath: move.trashURL.path) else {
+                failures.append("\(move.originalURL.lastPathComponent)：无法验证回滚路径")
+                continue
+            }
+
+            do {
+                try FileManager.default.moveItem(at: move.trashURL, to: move.originalURL)
+                restoredCount += 1
+                restoredBytes += move.byteSize
+            } catch {
+                failures.append("\(move.originalURL.lastPathComponent)：回滚失败：\(error.localizedDescription)")
+            }
+        }
+        return (restoredCount, restoredBytes, failures)
+    }
+
     private func makeArchivedSessionCleanupPlan() -> ArchivedSessionCleanupPlan {
         let sessionIds = archivedSessionIds(in: loadHarnessStorage(at: workspaceRegistryURL) ?? [:])
+        return makeArchivedSessionCleanupPlan(sessionIds: sessionIds)
+    }
+
+    /// Re-scan at the execution boundary. Alpha.3 writes a mandatory projection
+    /// checkpoint while sessions are disposed, so stopping the kernel can create a
+    /// cache record or transcript after the confirmation sheet was shown.
+    private func makeArchivedSessionCleanupPlan(sessionIds: [String]) -> ArchivedSessionCleanupPlan {
         guard !sessionIds.isEmpty else { return .empty }
 
-        let directories = locateSessionDirectories(ids: Set(sessionIds))
+        let idSet = Set(sessionIds)
+        let directories = locateSessionDirectories(ids: idSet)
+        let projectionCacheScan = locateProjectionCacheRecords(ids: idSet)
         let byteSize = directories.reduce(Int64(0)) { $0 + directoryByteSize(of: $1) }
-        return ArchivedSessionCleanupPlan(sessionIds: sessionIds, directories: directories, byteSize: byteSize)
+            + projectionCacheScan.records.reduce(Int64(0)) { $0 + fileByteSize(of: $1) }
+        return ArchivedSessionCleanupPlan(
+            sessionIds: sessionIds,
+            directories: directories,
+            projectionCacheRecords: projectionCacheScan.records,
+            validationFailures: projectionCacheScan.failures,
+            byteSize: byteSize
+        )
     }
 
     private func formattedByteSize(_ byteSize: Int64) -> String {
@@ -1185,6 +1721,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             )
             return
         }
+        guard plan.isValid else {
+            presentAlert(
+                title: "无法安全清除归档会话",
+                detail: "发现当前启动器不支持或不安全的投影缓存格式，因此没有移动或改写任何记录：\n\n" + plan.validationFailures.joined(separator: "\n"),
+                style: .warning
+            )
+            return
+        }
 
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -1194,6 +1738,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             detail += "\n\n这些会话没有留下记录文件，只需清理列表中的残留条目。"
         } else {
             detail += "\n\n将有 \(plan.directories.count) 份会话记录（共 \(formattedByteSize(plan.byteSize))）移入废纸篓，可以从废纸篓恢复。"
+        }
+        if !plan.projectionCacheRecords.isEmpty {
+            detail += "\n同时清理 \(plan.projectionCacheRecords.count) 份 alpha.3 逐会话投影缓存。"
         }
         detail += "\n\n内核会把会话列表常驻内存并回写，因此清除时会先停止再重启 Harness 内核；工作台里未发送的内容可能丢失。"
         alert.informativeText = detail
@@ -1207,6 +1754,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
     private func startArchivedSessionCleanup(_ plan: ArchivedSessionCleanupPlan) {
         if harnessWasStartedByThisApp, let process = harnessProcess, process.isRunning {
+            isHarnessTransitionInProgress = true
             probeTimer?.invalidate()
             probeTimer = nil
             probeAttempts = 0
@@ -1224,9 +1772,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             return
         }
 
-        probeHarness { [weak self] isReady in
+        probeHarness { [weak self] result in
             guard let self else { return }
-            if isReady {
+            if result != .unavailable {
                 self.presentAlert(
                     title: "请先停止外部 Harness 服务",
                     detail: "当前 127.0.0.1:3080 的服务不是由此 App 启动，因此没有擅自终止它。内核会把会话列表常驻内存并回写，运行中删除会被它覆盖。请先停止那个服务，再重新执行清除。",
@@ -1235,7 +1783,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                 return
             }
 
-            let outcome = self.removeArchivedSessions(plan)
+            let refreshedPlan = self.makeArchivedSessionCleanupPlan(sessionIds: plan.sessionIds)
+            self.isHarnessTransitionInProgress = true
+            let outcome = self.removeArchivedSessions(refreshedPlan)
+            self.isHarnessTransitionInProgress = false
             self.presentCleanupOutcome(outcome)
         }
     }
@@ -1245,9 +1796,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     /// be trashed stays visible in the workspace instead of becoming an orphaned file.
     private func removeArchivedSessions(_ plan: ArchivedSessionCleanupPlan) -> ArchivedSessionCleanupOutcome {
         var outcome = ArchivedSessionCleanupOutcome()
-        outcome.backupDirectory = backUpHarnessStorages()
+
+        guard plan.isValid else {
+            outcome.failures.append(contentsOf: plan.validationFailures.map { "\($0)：未执行任何清除。" })
+            return outcome
+        }
+
+        guard let registry = loadHarnessStorage(at: workspaceRegistryURL),
+              storageUnit(registry, matchesName: "workspace", version: 2) else {
+            outcome.failures.append("workspace.json：文件不是安全的普通文件，或格式不是受支持的 workspace v2；未执行任何清除。")
+            return outcome
+        }
+
+        let legacyCacheExists = FileManager.default.fileExists(atPath: legacySessionCacheURL.path)
+        let legacyCache = legacyCacheExists ? loadHarnessStorage(at: legacySessionCacheURL) : nil
+        if legacyCacheExists,
+           (legacyCache == nil || !storageUnit(legacyCache!, matchesName: "session_projcache", version: 3)) {
+            outcome.failures.append("\(legacyHarnessSessionCacheFileName)：文件不是安全的普通文件，或格式不是受支持的 session_projcache v3；未执行任何清除。")
+            return outcome
+        }
+
+        guard let backupDirectory = backUpHarnessStorages(
+            projectionCacheRecords: plan.projectionCacheRecords
+        ) else {
+            outcome.failures.append("无法创建改动前备份，未执行任何清除。")
+            return outcome
+        }
+        outcome.backupDirectory = backupDirectory
 
         var removedIds = Set(plan.sessionIds)
+        var trashedTranscripts: [TrashedPathMove] = []
         for directory in plan.directories {
             let sessionId = directory.lastPathComponent
             guard isRemovableSessionDirectory(directory) else {
@@ -1258,7 +1836,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
             let byteSize = directoryByteSize(of: directory)
             do {
-                try FileManager.default.trashItem(at: directory, resultingItemURL: nil)
+                let move = try moveCleanupItemToTrash(directory, byteSize: byteSize)
+                trashedTranscripts.append(move)
                 outcome.trashedDirectories += 1
                 outcome.freedBytes += byteSize
             } catch {
@@ -1269,20 +1848,99 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
         guard !removedIds.isEmpty else { return outcome }
 
-        if let registry = loadHarnessStorage(at: workspaceRegistryURL) {
+        do {
+            try writeHarnessStorage(workspaceRegistry(registry, removingSessionIds: removedIds), to: workspaceRegistryURL)
+            outcome.removedRegistryEntries = removedIds.count
+        } catch {
+            outcome.failures.append("\(harnessWorkspaceRegistryFileName)：\(error.localizedDescription)")
+            let restore = restoreTrashedCleanupItems(trashedTranscripts)
+            outcome.trashedDirectories -= restore.restoredCount
+            outcome.freedBytes -= restore.restoredBytes
+            outcome.failures.append(contentsOf: restore.failures)
+            return outcome
+        }
+
+        if let legacyCache {
             do {
-                try writeHarnessStorage(workspaceRegistry(registry, removingSessionIds: removedIds), to: workspaceRegistryURL)
-                outcome.removedRegistryEntries = removedIds.count
+                try writeHarnessStorage(
+                    sessionProjectionCache(legacyCache, removingSessionIds: removedIds),
+                    to: legacySessionCacheURL
+                )
             } catch {
-                outcome.failures.append("\(harnessWorkspaceRegistryFileName)：\(error.localizedDescription)")
+                outcome.failures.append("\(legacyHarnessSessionCacheFileName)：\(error.localizedDescription)")
+                let restore = restoreTrashedCleanupItems(trashedTranscripts)
+                outcome.trashedDirectories -= restore.restoredCount
+                outcome.freedBytes -= restore.restoredBytes
+                outcome.failures.append(contentsOf: restore.failures)
+                if restore.restoredCount == trashedTranscripts.count {
+                    do {
+                        try writeHarnessStorage(registry, to: workspaceRegistryURL)
+                        try writeHarnessStorage(legacyCache, to: legacySessionCacheURL)
+                        outcome.removedRegistryEntries = 0
+                    } catch {
+                        outcome.failures.append("workspace.json：自动恢复失败：\(error.localizedDescription)")
+                    }
+                } else {
+                    outcome.failures.append("部分 transcript 未能恢复，因此没有自动恢复 workspace.json；请使用备份人工处理。")
+                }
+                return outcome
             }
         }
 
-        if let cache = loadHarnessStorage(at: sessionCacheURL) {
+        var trashedProjectionRecords: [TrashedPathMove] = []
+        for record in plan.projectionCacheRecords {
+            let sessionId = record.deletingPathExtension().lastPathComponent
+            guard removedIds.contains(sessionId) else { continue }
+            guard isRemovableProjectionCacheRecord(record) else {
+                outcome.failures.append("\(record.lastPathComponent)：投影缓存路径或 v4 格式在执行前发生变化，开始自动回滚。")
+                let projectionRestore = restoreTrashedCleanupItems(trashedProjectionRecords)
+                let transcriptRestore = restoreTrashedCleanupItems(trashedTranscripts)
+                outcome.removedProjectionCacheRecords -= projectionRestore.restoredCount
+                outcome.trashedDirectories -= transcriptRestore.restoredCount
+                outcome.freedBytes -= projectionRestore.restoredBytes + transcriptRestore.restoredBytes
+                outcome.failures.append(contentsOf: projectionRestore.failures + transcriptRestore.failures)
+                if projectionRestore.restoredCount == trashedProjectionRecords.count,
+                   transcriptRestore.restoredCount == trashedTranscripts.count {
+                    do {
+                        try writeHarnessStorage(registry, to: workspaceRegistryURL)
+                        if let legacyCache { try writeHarnessStorage(legacyCache, to: legacySessionCacheURL) }
+                        outcome.removedRegistryEntries = 0
+                    } catch {
+                        outcome.failures.append("存储索引自动恢复失败：\(error.localizedDescription)")
+                    }
+                } else {
+                    outcome.failures.append("部分文件未能恢复，因此没有自动恢复存储索引；请使用备份人工处理。")
+                }
+                return outcome
+            }
+
             do {
-                try writeHarnessStorage(sessionProjectionCache(cache, removingSessionIds: removedIds), to: sessionCacheURL)
+                let byteSize = fileByteSize(of: record)
+                let move = try moveCleanupItemToTrash(record, byteSize: byteSize)
+                trashedProjectionRecords.append(move)
+                outcome.removedProjectionCacheRecords += 1
+                outcome.freedBytes += byteSize
             } catch {
-                outcome.failures.append("\(harnessSessionCacheFileName)：\(error.localizedDescription)")
+                outcome.failures.append("\(record.lastPathComponent)：\(error.localizedDescription)，开始自动回滚。")
+                let projectionRestore = restoreTrashedCleanupItems(trashedProjectionRecords)
+                let transcriptRestore = restoreTrashedCleanupItems(trashedTranscripts)
+                outcome.removedProjectionCacheRecords -= projectionRestore.restoredCount
+                outcome.trashedDirectories -= transcriptRestore.restoredCount
+                outcome.freedBytes -= projectionRestore.restoredBytes + transcriptRestore.restoredBytes
+                outcome.failures.append(contentsOf: projectionRestore.failures + transcriptRestore.failures)
+                if projectionRestore.restoredCount == trashedProjectionRecords.count,
+                   transcriptRestore.restoredCount == trashedTranscripts.count {
+                    do {
+                        try writeHarnessStorage(registry, to: workspaceRegistryURL)
+                        if let legacyCache { try writeHarnessStorage(legacyCache, to: legacySessionCacheURL) }
+                        outcome.removedRegistryEntries = 0
+                    } catch {
+                        outcome.failures.append("存储索引自动恢复失败：\(error.localizedDescription)")
+                    }
+                } else {
+                    outcome.failures.append("部分文件未能恢复，因此没有自动恢复存储索引；请使用备份人工处理。")
+                }
+                return outcome
             }
         }
 
@@ -1291,21 +1949,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
     /// Copies both storage files aside before they are rewritten, keeping the most recent
     /// few. They are small, and a bad rewrite would otherwise cost the whole session list.
-    private func backUpHarnessStorages() -> URL? {
+    private func backUpHarnessStorages(projectionCacheRecords: [URL]) -> URL? {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        formatter.dateFormat = "yyyyMMdd-HHmmss-SSS"
 
-        let backupRoot = logURL.deletingLastPathComponent().appendingPathComponent("storage-backups", isDirectory: true)
+        let logDirectory = logURL.deletingLastPathComponent().standardizedFileURL
+        guard ensureRealDirectory(logDirectory) else { return nil }
+
+        let backupRoot = logDirectory.appendingPathComponent("storage-backups", isDirectory: true).standardizedFileURL
+        guard backupRoot.deletingLastPathComponent().path == logDirectory.path,
+              ensureRealDirectory(backupRoot) else { return nil }
         let backupDirectory = backupRoot.appendingPathComponent(formatter.string(from: Date()), isDirectory: true)
 
         do {
-            try FileManager.default.createDirectory(at: backupDirectory, withIntermediateDirectories: true)
-            for source in [workspaceRegistryURL, sessionCacheURL] {
+            guard !FileManager.default.fileExists(atPath: backupDirectory.path),
+                  backupDirectory.deletingLastPathComponent().path == backupRoot.path else { return nil }
+            try FileManager.default.createDirectory(at: backupDirectory, withIntermediateDirectories: false)
+            guard ensureRealDirectory(backupDirectory) else { return nil }
+            for source in [workspaceRegistryURL, legacySessionCacheURL] {
                 guard FileManager.default.fileExists(atPath: source.path) else { continue }
+                guard isSafeRegularStorageFile(source) else { throw CocoaError(.fileReadInvalidFileName) }
                 let destination = backupDirectory.appendingPathComponent(source.lastPathComponent, isDirectory: false)
-                try? FileManager.default.removeItem(at: destination)
                 try FileManager.default.copyItem(at: source, to: destination)
+            }
+
+            if !projectionCacheRecords.isEmpty {
+                let recordsBackupDirectory = backupDirectory
+                    .appendingPathComponent(harnessSessionCacheDirectoryName, isDirectory: true)
+                    .appendingPathComponent(harnessSessionCacheRecordsDirectoryName, isDirectory: true)
+                try FileManager.default.createDirectory(at: recordsBackupDirectory, withIntermediateDirectories: true)
+                for source in projectionCacheRecords {
+                    guard isRemovableProjectionCacheRecord(source) else { throw CocoaError(.fileReadInvalidFileName) }
+                    try FileManager.default.copyItem(
+                        at: source,
+                        to: recordsBackupDirectory.appendingPathComponent(source.lastPathComponent, isDirectory: false)
+                    )
+                }
             }
         } catch {
             return nil
@@ -1313,6 +1993,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
 
         pruneHarnessStorageBackups(in: backupRoot)
         return backupDirectory
+    }
+
+    private func ensureRealDirectory(_ url: URL) -> Bool {
+        let directory = url.standardizedFileURL
+        if !FileManager.default.fileExists(atPath: directory.path) {
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            } catch {
+                return false
+            }
+        }
+        guard let values = try? directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else {
+            return false
+        }
+        return values.isDirectory == true && values.isSymbolicLink != true
     }
 
     private func pruneHarnessStorageBackups(in backupRoot: URL) {
@@ -1323,17 +2018,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         ) else { return }
 
         let sorted = backups
-            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+            .filter { candidate in
+                guard candidate.standardizedFileURL.deletingLastPathComponent().path == backupRoot.standardizedFileURL.path,
+                      let values = try? candidate.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else {
+                    return false
+                }
+                return values.isDirectory == true && values.isSymbolicLink != true
+            }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
         guard sorted.count > harnessStorageBackupLimit else { return }
 
         for obsolete in sorted.prefix(sorted.count - harnessStorageBackupLimit) {
-            try? FileManager.default.removeItem(at: obsolete)
+            try? FileManager.default.trashItem(at: obsolete, resultingItemURL: nil)
         }
     }
 
     private func cleanupLogLine(for outcome: ArchivedSessionCleanupOutcome) -> String {
         var line = "Archived session cleanup: trashed \(outcome.trashedDirectories) transcript(s), "
+        line += "removed \(outcome.removedProjectionCacheRecords) projection cache record(s), "
         line += "freed \(outcome.freedBytes) bytes, removed \(outcome.removedRegistryEntries) registry entr(y/ies)."
         if !outcome.failures.isEmpty {
             line += " Failures: \(outcome.failures.joined(separator: "; "))"
@@ -1348,6 +2050,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         if outcome.removedRegistryEntries > 0 {
             detail += "\n工作台列表中的 \(outcome.removedRegistryEntries) 个条目也已清除。"
         }
+        if outcome.removedProjectionCacheRecords > 0 {
+            detail += "\n已清理 \(outcome.removedProjectionCacheRecords) 份逐会话投影缓存。"
+        }
         if let backupDirectory = outcome.backupDirectory {
             detail += "\n\n改动前的列表数据已备份到：\n\(backupDirectory.path)"
         }
@@ -1357,7 +2062,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             return
         }
 
-        detail += "\n\n以下项目没有清除，仍保留在工作台中：\n" + outcome.failures.joined(separator: "\n")
+        detail += "\n\n以下项目没有完全处理：\n" + outcome.failures.joined(separator: "\n")
         presentAlert(title: "清除未完全完成", detail: detail, style: .warning)
     }
 
@@ -1424,10 +2129,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     private func connectToOrStartHarness() {
-        probeHarness { [weak self] isReady in
+        probeHarness { [weak self] result in
             guard let self else { return }
-            if isReady {
+            if result == .ready {
                 self.loadHarnessPage()
+            } else if result == .authenticationRequired {
+                // Let WKWebView use its own HttpOnly browser-session cookie if one
+                // exists. We never enumerate or inspect browser storage; the
+                // official final 200/401 response is the authority.
+                self.loadHarnessPage()
+            } else if result == .occupiedUnknown {
+                self.showStartup(
+                    status: "本机端口 3080 已被占用",
+                    detail: "该服务未通过 DeepSeek Harness 身份检查。为避免连接或终止错误进程，App 没有继续启动。请先处理占用端口的服务，再点“重新尝试”。",
+                    isError: true
+                )
             } else if let process = self.harnessProcess, process.isRunning {
                 self.showStartup(status: "正在启动 DeepSeek Harness", detail: "本机服务正在初始化…", isError: false)
                 self.beginProbeLoop()
@@ -1438,8 +2154,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     private func startHarnessProcess() {
+        isHarnessTransitionInProgress = true
+        if pendingHarnessSwitchFromVersion == nil,
+           !isAutomaticHarnessRollback,
+           selectedHarnessPackageVersion != lastKnownGoodHarnessPackageVersion {
+            pendingHarnessSwitchFromVersion = lastKnownGoodHarnessPackageVersion
+        }
+
         let discovery = discoverNodeRuntime()
         guard let runtime = discovery.runtime else {
+            isHarnessTransitionInProgress = false
             showStartup(
                 status: "需要兼容的 Node.js",
                 detail: discovery.detail,
@@ -1449,6 +2173,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
 
         guard confirmOfficialPackageDownloadIfNeeded() else {
+            isHarnessTransitionInProgress = false
             showStartup(
                 status: "尚未启动 Harness",
                 detail: "首次启动需要你确认通过 npx 获取官方 \(harnessPackageSpecifier) 软件包。",
@@ -1460,6 +2185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         do {
             try ensureWorkspaceExists()
             try prepareLogFile()
+            pendingHarnessAuthenticationURL = nil
             appendLog("\n--- Native app launch \(ISO8601DateFormatter().string(from: Date())) ---\n")
             appendLog("Harness package: \(harnessPackageSpecifier)\n")
             appendLog("Node: \(runtime.version) at \(runtime.nodeURL.path)\n")
@@ -1469,21 +2195,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             process.executableURL = runtime.npxURL
             // The native wrapper owns presentation. Prevent dsh from also opening the
             // same localhost UI in the user's default browser on every app launch.
-            process.arguments = ["--yes", harnessPackageSpecifier, "web", "--no-open"]
+            process.arguments = [
+                "--yes", harnessPackageSpecifier, "web",
+                "--host", "127.0.0.1", "--port", "3080", "--no-open"
+            ]
             process.currentDirectoryURL = workspaceURL
             var environment = ProcessInfo.processInfo.environment
             let runtimeBin = runtime.nodeURL.deletingLastPathComponent().path
             let inheritedPath = environment["PATH"] ?? "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
             environment["PATH"] = "\(runtimeBin):\(inheritedPath)"
             process.environment = environment
-            process.standardOutput = harnessLogHandle
-            process.standardError = harnessLogHandle
+            configureHarnessOutputCapture(for: process)
             process.terminationHandler = { [weak self] terminatedProcess in
                 DispatchQueue.main.async {
                     guard let self, !self.isTerminating else { return }
                     self.harnessProcess = nil
                     self.harnessWasStartedByThisApp = false
+                    self.activeOwnedHarnessVersion = nil
+                    self.closeHarnessOutputCapture(afterProcessExit: true)
                     self.closeHarnessLogHandle()
+                    self.pendingHarnessAuthenticationURL = nil
+                    self.refreshHarnessVersionMenuItems()
 
                     if self.restartHarnessAfterTermination {
                         self.restartHarnessAfterTermination = false
@@ -1491,9 +2223,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                         self.pendingArchivedSessionCleanup = nil
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self] in
                             guard let self else { return }
-                            // The kernel keeps both storage files in memory and rewrites them, so
-                            // the removal only sticks while no harness process is running.
-                            let outcome = cleanup.map { self.removeArchivedSessions($0) }
+                            // Re-scan after graceful disposal: alpha.3 may have written a final
+                            // transcript or v4 projection checkpoint while it was stopping.
+                            let outcome = cleanup.map {
+                                self.removeArchivedSessions(
+                                    self.makeArchivedSessionCleanupPlan(sessionIds: $0.sessionIds)
+                                )
+                            }
                             self.startHarnessProcess()
                             if let outcome {
                                 self.appendLog(self.cleanupLogLine(for: outcome))
@@ -1503,10 +2239,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
                         return
                     }
 
-                    self.probeHarness { isReady in
-                        if isReady {
+                    if self.recoverFromHarnessStartupFailure(
+                        "process exited with code \(terminatedProcess.terminationStatus)"
+                    ) {
+                        return
+                    }
+
+                    self.probeHarness { result in
+                        if result == .ready {
                             self.loadHarnessPage()
                         } else if !self.harnessPageHasLoaded {
+                            self.isHarnessTransitionInProgress = false
                             self.showStartup(
                                 status: "Harness 启动失败",
                                 detail: "进程已退出（代码 \(terminatedProcess.terminationStatus)）。请查看日志后重试。",
@@ -1520,6 +2263,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             try process.run()
             harnessProcess = process
             harnessWasStartedByThisApp = true
+            activeOwnedHarnessVersion = selectedHarnessPackageVersion
+            refreshHarnessVersionMenuItems()
             showStartup(
                 status: "正在启动 DeepSeek Harness",
                 detail: "正在运行 \(harnessPackageSpecifier)\n工作区：\(workspaceURL.path)",
@@ -1527,8 +2272,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             )
             beginProbeLoop()
         } catch {
+            closeHarnessOutputCapture()
             appendLog("Native launcher error: \(error.localizedDescription)\n")
-            showStartup(status: "无法启动 Harness", detail: error.localizedDescription, isError: true)
+            if !recoverFromHarnessStartupFailure(error.localizedDescription) {
+                isHarnessTransitionInProgress = false
+                showStartup(status: "无法启动 Harness", detail: error.localizedDescription, isError: true)
+            }
         }
     }
 
@@ -1552,9 +2301,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
 
         let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = "下载并启动官方 DeepSeek Harness？"
-        alert.informativeText = "此非官方启动器不内置 Harness。继续后，npx 将从 npm 获取并运行 \(harnessPackageSpecifier)。API Key 不会包含在 App 中，请稍后在 Harness 的 Settings → Models 中自行配置。"
+        let isAlpha = selectedHarnessPackageVersion.contains("-alpha.")
+        alert.alertStyle = isAlpha ? .warning : .informational
+        alert.messageText = isAlpha ? "下载并启动官方 Harness Alpha？" : "下载并启动官方 DeepSeek Harness？"
+        var detail = "此非官方启动器不内置 Harness。继续后，npx 将从 npm 获取并运行 \(harnessPackageSpecifier)。API Key 不会包含在 App 中，请稍后在 Harness 的 Settings → Models 中自行配置。"
+        if isAlpha {
+            detail += "\n\n这是 Developer Preview 实验版，可能写入新版数据格式。v3.0.0 会保留 0.1.1-rc.2 自动回退点，但版本回退不会逆转上游数据迁移。自定义 SQLite Session Profile 必须先在旧版导出。"
+        }
+        alert.informativeText = detail
         alert.addButton(withTitle: "下载并启动")
         alert.addButton(withTitle: "取消")
 
@@ -1659,6 +2413,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         harnessLogHandle = handle
     }
 
+    private func configureHarnessOutputCapture(for process: Process) {
+        closeHarnessOutputCapture()
+        guard let logHandle = harnessLogHandle else { return }
+        let relay = HarnessProcessOutputRelay(logHandle: logHandle, expectedBaseURL: harnessBaseURL)
+        harnessOutputRelay = relay
+        relay.attach(to: process)
+    }
+
+    private func synchronizeHarnessAuthenticationURL() {
+        if let authenticationURL = harnessOutputRelay?.authenticationURL() {
+            pendingHarnessAuthenticationURL = authenticationURL
+        }
+    }
+
+    private func closeHarnessOutputCapture(afterProcessExit: Bool = false) {
+        guard let relay = harnessOutputRelay else { return }
+        if afterProcessExit {
+            relay.closeAfterProcessExit()
+        } else {
+            relay.invalidateWithoutDraining()
+        }
+        if let authenticationURL = relay.authenticationURL() {
+            pendingHarnessAuthenticationURL = authenticationURL
+        }
+        harnessOutputRelay = nil
+    }
+
     private func closeHarnessLogHandle() {
         try? harnessLogHandle?.synchronize()
         try? harnessLogHandle?.close()
@@ -1666,7 +2447,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     private func appendLog(_ message: String) {
-        guard let data = message.data(using: .utf8) else { return }
+        if let relay = harnessOutputRelay {
+            relay.appendLog(message)
+            return
+        }
+        let sanitized = redactedHarnessLogText(message)
+        guard let data = sanitized.data(using: .utf8) else { return }
         try? harnessLogHandle?.write(contentsOf: data)
     }
 
@@ -1685,6 +2471,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         if probeAttempts > maximumProbeAttempts {
             probeTimer?.invalidate()
             probeTimer = nil
+            if recoverFromHarnessStartupFailure("timed out waiting for authenticated HTTP readiness") {
+                return
+            }
+            isHarnessTransitionInProgress = false
             showStartup(
                 status: "Harness 尚未就绪",
                 detail: "等待 90 秒后仍未收到 HTTP 200。请查看日志后重试。",
@@ -1693,9 +2483,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
             return
         }
 
-        probeHarness { [weak self] isReady in
+        probeHarness { [weak self] result in
             guard let self else { return }
-            if isReady {
+            self.synchronizeHarnessAuthenticationURL()
+            if result == .ready || (result == .authenticationRequired && self.pendingHarnessAuthenticationURL != nil) {
                 self.probeTimer?.invalidate()
                 self.probeTimer = nil
                 self.loadHarnessPage()
@@ -1703,19 +2494,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         }
     }
 
-    private func probeHarness(completion: @escaping (Bool) -> Void) {
+    private func probeHarness(completion: @escaping (HarnessProbeResult) -> Void) {
         guard !probeInFlight else {
-            completion(false)
+            completion(.unavailable)
             return
         }
         probeInFlight = true
 
-        var components = URLComponents(url: harnessURL, resolvingAgainstBaseURL: false)
+        // Always probe the bare origin. The alpha.3 launch token must be handed to
+        // WKWebView, not this cookie-less URLSession, so its HttpOnly cookie is retained.
+        var components = URLComponents(url: harnessBaseURL, resolvingAgainstBaseURL: false)
         components?.queryItems = [
             URLQueryItem(name: "_native_probe", value: String(Int(Date().timeIntervalSince1970 * 1_000)))
         ]
 
-        var request = URLRequest(url: components?.url ?? harnessURL)
+        var request = URLRequest(url: components?.url ?? harnessBaseURL)
         request.httpMethod = "GET"
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.timeoutInterval = 1.5
@@ -1724,25 +2517,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         request.setValue("text/html,application/xhtml+xml", forHTTPHeaderField: "Accept")
 
         probeSession.dataTask(with: request) { [weak self] data, response, _ in
-            let statusIsReady = (response as? HTTPURLResponse)?.statusCode == 200
+            let statusCode = (response as? HTTPURLResponse)?.statusCode
             let pagePrefix = data.flatMap { String(data: $0.prefix(32_768), encoding: .utf8) }?.lowercased() ?? ""
             let identityIsReady = pagePrefix.contains("deepseek") || pagePrefix.contains("dsh-web")
-            let isReady = statusIsReady && identityIsReady
+            let result: HarnessProbeResult
+            if statusCode == 200 && identityIsReady {
+                result = .ready
+            } else if statusCode == 401 && pagePrefix.contains("dsh web authentication required") {
+                result = .authenticationRequired
+            } else if statusCode != nil {
+                result = .occupiedUnknown
+            } else {
+                result = .unavailable
+            }
             DispatchQueue.main.async {
                 self?.probeInFlight = false
-                completion(isReady)
+                completion(result)
             }
         }.resume()
     }
 
     private func loadHarnessPage() {
         guard !harnessPageHasLoaded else { return }
+        synchronizeHarnessAuthenticationURL()
         harnessPageHasLoaded = true
-        showStartup(status: "正在载入工作台", detail: "本机服务已就绪（HTTP 200）", isError: false)
-        var request = URLRequest(url: harnessURL)
+        validatedMainFrameHarnessResponse = false
+        let targetURL = pendingHarnessAuthenticationURL ?? harnessBaseURL
+        let detail = pendingHarnessAuthenticationURL == nil
+            ? "本机服务已就绪（HTTP 200）"
+            : "正在安全建立本机浏览器会话…"
+        showStartup(status: "正在载入工作台", detail: detail, isError: false)
+        var request = URLRequest(url: targetURL)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         webView.load(request)
     }
+
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard message.name == nativeChromeMessageName, message.frameInfo.isMainFrame else { return }
@@ -1840,18 +2649,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard validatedMainFrameHarnessResponse,
+              let finalURL = webView.url,
+              isLocalHarnessURL(finalURL) else { return }
         window.title = appDisplayName
+        pendingHarnessAuthenticationURL = nil
+        markOwnedHarnessReady()
+        refreshHarnessVersionMenuItems()
         revealWebContent()
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         harnessPageHasLoaded = false
-        showStartup(status: "页面载入失败", detail: error.localizedDescription, isError: true)
+        validatedMainFrameHarnessResponse = false
+        if !recoverFromHarnessStartupFailure(error.localizedDescription) {
+            isHarnessTransitionInProgress = false
+            showStartup(status: "页面载入失败", detail: error.localizedDescription, isError: true)
+        }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         harnessPageHasLoaded = false
-        showStartup(status: "无法连接本机 Harness", detail: error.localizedDescription, isError: true)
+        validatedMainFrameHarnessResponse = false
+        if !recoverFromHarnessStartupFailure(error.localizedDescription) {
+            isHarnessTransitionInProgress = false
+            showStartup(status: "无法连接本机 Harness", detail: error.localizedDescription, isError: true)
+        }
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationResponse: WKNavigationResponse,
+        decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+    ) {
+        guard navigationResponse.isForMainFrame,
+              let url = navigationResponse.response.url,
+              isLocalHarnessURL(url),
+              let response = navigationResponse.response as? HTTPURLResponse else {
+            decisionHandler(.allow)
+            return
+        }
+
+        if response.statusCode == 200 {
+            validatedMainFrameHarnessResponse = true
+            decisionHandler(.allow)
+            return
+        }
+
+        if (300...399).contains(response.statusCode) {
+            validatedMainFrameHarnessResponse = false
+            decisionHandler(.allow)
+            return
+        }
+
+        decisionHandler(.cancel)
+        harnessPageHasLoaded = false
+        validatedMainFrameHarnessResponse = false
+        pendingHarnessAuthenticationURL = nil
+        let reason = "local Harness page returned HTTP \(response.statusCode)"
+        if !recoverFromHarnessStartupFailure(reason) {
+            isHarnessTransitionInProgress = false
+            showStartup(
+                status: response.statusCode == 401 ? "Harness 需要访问令牌" : "Harness 页面响应异常",
+                detail: response.statusCode == 401
+                    ? "本机服务拒绝了当前浏览器会话。请停止外部 Harness 服务后重试，由此 App 重新建立安全会话。"
+                    : reason,
+                isError: true
+            )
+        }
+        return
     }
 
     func webView(
@@ -1913,16 +2779,66 @@ private func runSelfTests() -> Int32 {
     expect(SemanticVersion("0.1.0-rc.6")! < SemanticVersion("0.1.0")!, "stable version follows prerelease")
     expect(SemanticVersion("0.1.0")! < SemanticVersion("0.2.0")!, "compare minor versions")
     expect(
-        newestOfficialHarnessVersion(in: ["latest": "0.1.0-rc.6", "next": "0.1.0-rc.7"]) == "0.1.0-rc.7",
+        SemanticVersion("0.1.1-rc.2")! < SemanticVersion("0.1.2-alpha.3")!,
+        "treat alpha.3 as newer than the current rc.2 line"
+    )
+    expect(
+        newestOfficialHarnessVersion(
+            in: ["latest": "0.1.0-rc.6", "next": "0.1.0-rc.7", "alpha": "0.1.2-alpha.3"],
+            channel: .defaultRelease
+        ) == "0.1.0-rc.7",
         "prefer newer official dist-tag"
     )
     expect(
-        newestOfficialHarnessVersion(in: ["latest": "0.1.0", "next": "0.1.0-rc.9"]) == "0.1.0",
+        newestOfficialHarnessVersion(
+            in: ["latest": "0.1.0", "next": "0.1.0-rc.9"],
+            channel: .defaultRelease
+        ) == "0.1.0",
         "prefer stable release over its prerelease"
     )
     expect(
-        newestOfficialHarnessVersion(in: ["latest": "invalid", "next": "0.1.0-rc.6"]) == "0.1.0-rc.6",
+        newestOfficialHarnessVersion(
+            in: ["latest": "invalid", "next": "0.1.0-rc.6"],
+            channel: .defaultRelease
+        ) == "0.1.0-rc.6",
         "ignore invalid official metadata entries"
+    )
+    expect(
+        newestOfficialHarnessVersion(
+            in: ["latest": "0.1.1-rc.2", "next": "0.1.1-rc.2", "alpha": "0.1.2-alpha.3"],
+            channel: .alpha
+        ) == "0.1.2-alpha.3",
+        "select the explicit alpha channel"
+    )
+    expect(
+        newestOfficialHarnessVersion(
+            in: ["latest": "0.1.2", "next": "0.1.1-rc.2", "alpha": "0.1.2-alpha.3"],
+            channel: .alpha
+        ) == "0.1.2",
+        "let an alpha user graduate to a newer stable release"
+    )
+
+    let testToken = String(repeating: "A", count: 43)
+    let outputInspection = inspectHarnessOutputLine(
+        "dsh web: http://127.0.0.1:3080/?token=\(testToken)",
+        expectedBaseURL: harnessBaseURL
+    )
+    expect(outputInspection.authenticationURL != nil, "capture the exact local alpha authentication URL")
+    expect(!outputInspection.sanitizedLine.contains(testToken), "redact the alpha browser token from logs")
+    expect(outputInspection.sanitizedLine.contains("<redacted>"), "leave an explicit token-redaction marker")
+    expect(
+        inspectHarnessOutputLine(
+            "dsh web: https://example.com:3080/?token=\(testToken)",
+            expectedBaseURL: harnessBaseURL
+        ).authenticationURL == nil,
+        "reject a non-local authentication URL"
+    )
+    expect(
+        inspectHarnessOutputLine(
+            "dsh web: http://127.0.0.1:3080/?token=short",
+            expectedBaseURL: harnessBaseURL
+        ).authenticationURL == nil,
+        "reject a malformed alpha browser token"
     )
     expect(
         prefersDarkChrome(red: 0.018, green: 0.043, blue: 0.115, currentlyDark: false),
@@ -1975,6 +2891,9 @@ private func runSelfTests() -> Int32 {
         ]
     ]
 
+    expect(storageUnit(registry, matchesName: "workspace", version: 2), "accept the official workspace v2 storage")
+    expect(!storageUnit(registry, matchesName: "workspace", version: 3), "reject an unknown future workspace storage")
+
     expect(archivedSessionIds(in: registry) == ["session-1", "session-2"], "read archived ids without duplicates or non-strings")
     expect(archivedSessionIds(in: [:]).isEmpty, "tolerate a registry without an archive set")
 
@@ -2001,6 +2920,7 @@ private func runSelfTests() -> Int32 {
         "unit": ["name": "session_projcache", "version": 3],
         "tables": ["sessions": ["session-1": ["rows": [:]], "session-2": ["rows": [:]]]]
     ]
+    expect(storageUnit(cache, matchesName: "session_projcache", version: 3), "accept the legacy projection-cache v3 storage")
     let prunedCache = sessionProjectionCache(cache, removingSessionIds: ["session-1"])
     let prunedSessions = (prunedCache["tables"] as? [String: Any])?["sessions"] as? [String: Any]
     expect(prunedSessions?.count == 1 && prunedSessions?["session-2"] != nil, "drop only the removed session from the cache")
@@ -2009,8 +2929,51 @@ private func runSelfTests() -> Int32 {
         "tolerate a cache without a sessions table"
     )
 
+    let fixtureRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("deepseek-harness-projection-self-test-\(UUID().uuidString)", isDirectory: true)
+    do {
+        try FileManager.default.createDirectory(at: fixtureRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fixtureRoot) }
+
+        let keptRecord = fixtureRoot.appendingPathComponent("session-1.json", isDirectory: false)
+        let otherRecord = fixtureRoot.appendingPathComponent("session-2.json", isDirectory: false)
+        let v4RecordData = Data(#"{"version":4,"record":{}}"#.utf8)
+        try v4RecordData.write(to: keptRecord)
+        try v4RecordData.write(to: otherRecord)
+        try FileManager.default.createSymbolicLink(
+            at: fixtureRoot.appendingPathComponent("session-link.json", isDirectory: false),
+            withDestinationURL: keptRecord
+        )
+        let linkedRecord = fixtureRoot.appendingPathComponent("session-link.json", isDirectory: false)
+        expect(isRegularFileWithoutSymlinks(keptRecord), "accept a direct regular storage file")
+        expect(!isRegularFileWithoutSymlinks(linkedRecord), "reject a storage-file symlink before read or rewrite")
+        let nested = fixtureRoot.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: false)
+        try v4RecordData.write(to: nested.appendingPathComponent("session-nested.json"))
+        let futureRecord = fixtureRoot.appendingPathComponent("session-future.json", isDirectory: false)
+        try Data(#"{"version":5,"record":{}}"#.utf8).write(to: futureRecord)
+
+        let scan = scanProjectionCacheRecords(
+            in: fixtureRoot,
+            matching: ["session-1", "session-link", "session-nested", "session-future", "../escape"]
+        )
+        expect(scan.records.map(\.lastPathComponent) == ["session-1.json"], "accept only direct regular v4 cache records")
+        expect(
+            scan.failures.count == 2
+                && scan.failures.contains { $0.contains("session-link.json") }
+                && scan.failures.contains { $0.contains("session-future.json") },
+            "fail closed on matching symlink and future projection-cache records"
+        )
+        expect(
+            (try? Data(contentsOf: otherRecord)) == v4RecordData,
+            "leave an unselected v4 cache record byte-identical"
+        )
+    } catch {
+        failures.append("projection-cache filesystem fixture failed: \(error.localizedDescription)")
+    }
+
     if failures.isEmpty {
-        print("Self-test passed: semantic versioning, official dist-tag selection, chrome luminance and archived session cleanup")
+        print("Self-test passed: alpha channel, token redaction, semantic versioning, chrome luminance and archived session cleanup")
         return 0
     }
 

@@ -4,7 +4,7 @@
 <p align="center">非官方启动器 · 独立窗口 · 本机工作区</p>
 
 <p align="center">
-  <a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.7.0/DeepSeek-Harness-v2.7.0-macOS-arm64.dmg"><strong>↓ 下载 v2.7.0</strong></a>
+  <a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v3.0.0/DeepSeek-Harness-v3.0.0-macOS-arm64.dmg"><strong>↓ 下载 v3.0.0</strong></a>
 </p>
 <p align="center">
   <a href="./INSTALL.md">安装说明</a>
@@ -14,7 +14,7 @@
 <p align="center">Apple Silicon · macOS 12+ · Node.js 22.19–22.x 或 24.0+（不支持 23.x）</p>
 
 > [!WARNING]
-> **v2.7.0 尚未公证。** 首次打开：在访达中右键 App → **打开** → 再确认；不要关闭 Gatekeeper。
+> **v3.0.0 尚未公证。** 首次打开：在访达中右键 App → **打开** → 再确认；不要关闭 Gatekeeper。
 
 <p align="center">
   <picture>
@@ -31,10 +31,23 @@
 - **从程序坞打开**：独立窗口、菜单栏和 App 图标。
 - **原生窗口交互**：拖动标题栏移动窗口；`Command +` / `Command -` 调整字体，`Command 0` 恢复默认大小。
 - **没有浏览器痕迹**：标题栏与工作台背景融为一体并跟随明暗主题；右键只保留原生编辑命令，控件不再出现网页手型光标与文字选中，整页橡皮筋回弹和网页滚动条也一并去掉。
-- **一键检查内核更新**：从 App 菜单读取 npm 官方 `latest` / `next`，自动选择更高版本；每次切换都会记录旧版本，随时可以回退到上一版。
+- **默认 / Alpha 双更新通道**：默认通道读取 npm 官方 `latest` / `next`；显式启用实验通道后才读取 `alpha`。每次切换都会记录旧版本并保留自动回退点。
 - **归档的会话可以真正删除**：官方内核只把会话隐藏，启动器可以把这些记录移入废纸篓，并同时清干净侧边栏里的残留条目。
 - **服务留在本机**：Harness Web UI 仅监听 `127.0.0.1:3080`。
 - **工作区由你选择**：使用隔离的默认目录，或切换到自己的项目文件夹。
+
+## v3.0.0 主版本更新：完整支持 dsh 0.1.2-alpha.3
+
+官方 alpha.3 给本机 Web UI 增加了本次启动浏览器令牌，并把 Session 投影缓存从单文件改成逐会话文件。旧启动器只改版本号会得到 401，同时把令牌原样写进日志。v3.0.0 以主版本升级补齐了这条兼容链：
+
+- 启动器从自己创建的进程输出中严格识别本机认证 URL，只在内存中交给 `WKWebView` 完成 303 / HttpOnly Cookie 交换。
+- 所有日志写入都先脱敏，`token=` 后的值不会进入 `harness-web.log`、弹窗或 UserDefaults。
+- 401 被识别为“已有需要认证的外部 Harness”，不会误判端口空闲后再启动第二个服务。
+- 新版未能通过最终 HTTP 200 和页面验证时，自动恢复上一个已知可用内核。
+- 更新菜单新增 Alpha 实验通道；普通 `latest` / `next` 通道仍不会静默跨入 alpha。
+- 归档清理同时兼容旧 `session_projcache.json` 与 alpha.3 的 `session_projcache/sessions/<id>.json`，未知格式、软链接或备份失败都会停止清理。
+
+本版本默认推荐 `@deepseek-ai/dsh@0.1.2-alpha.3`，已验证回退点为 `0.1.1-rc.2`，历史最低保留到 `0.1.0-rc.6`。alpha.3 已移除可选 SQLite Session 后端；自定义 SQLite Profile 必须先在旧版导出。默认 JSONL Session 不受影响。
 
 ## v2.7.0 重点更新：归档之后，可以真正删除
 
@@ -95,9 +108,9 @@ Harness 的工作台本质仍由官方 Web UI 提供，macOS 启动器继续使�
 
 ## 三步安装
 
-1. [下载 v2.7.0 DMG](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.7.0/DeepSeek-Harness-v2.7.0-macOS-arm64.dmg)，打开后把 **DeepSeek Harness.app** 拖入 **Applications**。
+1. [下载 v3.0.0 DMG](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v3.0.0/DeepSeek-Harness-v3.0.0-macOS-arm64.dmg)，打开后把 **DeepSeek Harness.app** 拖入 **Applications**。
 2. 在“应用程序”中右键 App，选择 **打开**，然后在 macOS 提示中再次确认。
-3. 首次启动时确认通过 `npx` 获取默认版本的官方 `@deepseek-ai/dsh@0.1.0-rc.6`，等待工作台出现。
+3. v3.0.0 首次启动时确认通过 `npx` 获取默认推荐的官方 `@deepseek-ai/dsh@0.1.2-alpha.3`，等待安全浏览器会话建立。
 
 首次获取需要联网。请先从 [Node.js 官网](https://nodejs.org/en/download) 安装 Node.js；Harness 与 Node.js 均不包含在 DMG 中。
 
@@ -132,7 +145,7 @@ Harness 的工作台本质仍由官方 Web UI 提供，macOS 启动器继续使�
 - **Node.js**：由用户安装，用于运行 `npx` 与 Harness。
 
 > [!NOTE]
-> DeepSeek Harness 仍处于 **Developer Preview**，可能出现破坏兼容性的变化。本启动器内置默认版本 `@deepseek-ai/dsh@0.1.0-rc.6`；只有你主动选择“检查并更新 Harness 内核…”并确认后，才会切换到 npm 官方 `latest` / `next` 中更高的版本。每次切换前的版本都会记入历史，可从菜单逐级回退，直到回到内置版本。
+> DeepSeek Harness 仍处于 **Developer Preview**，可能出现破坏兼容性的变化。v3.0.0 默认推荐并在首次下载前明确警告 `@deepseek-ai/dsh@0.1.2-alpha.3`，已知可用回退点为 `0.1.1-rc.2`。后续继续跟进 npm Alpha 通道必须显式启用；每次切换前的版本都会记入历史。回退会恢复执行版本，但不会自动逆转上游已经写入的数据格式变化。
 
 这是 FlyX 独立制作的非官方启动器，与 DeepSeek 或 Apple Inc. 无隶属、赞助或背书关系。名称仅用于说明兼容性；鲸鱼图标与主视觉不是官方素材。
 
@@ -179,6 +192,8 @@ Harness 的工作台本质仍由官方 Web UI 提供，macOS 启动器继续使�
 
 **怎样更新 Harness 内核？** 打开菜单栏中的 **DeepSeek Harness → 检查并更新 Harness 内核…**。若官方存在更高版本，启动器会自动选中并请求确认；若当前 3080 服务由其他终端启动，只保存选择，不会擅自终止外部进程。
 
+**为什么默认通道看不到 alpha？** 默认通道只读取 `latest` / `next`。需要测试官方实验版时，先勾选 **使用 Alpha 实验更新通道**，再检查更新。
+
 **新内核不好用怎么办？** 打开 **DeepSeek Harness → 回退到上一版内核 …**，菜单里直接显示会回退到哪个版本。启动器最多记录 10 次切换历史，可以连续回退；没有可回退的版本时该菜单项为灰色。
 
 </details>
@@ -186,11 +201,11 @@ Harness 的工作台本质仍由官方 Web UI 提供，macOS 启动器继续使�
 <details>
 <summary><strong>验证下载文件与本地构建</strong></summary>
 
-下载 [SHA-256 文件](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v2.7.0/DeepSeek-Harness-v2.7.0-macOS-arm64.dmg.sha256) 后，在终端运行：
+下载 [SHA-256 文件](https://github.com/FlyXingByte/deepseek-harness-macos/releases/download/v3.0.0/DeepSeek-Harness-v3.0.0-macOS-arm64.dmg.sha256) 后，在终端运行：
 
 ```sh
 cd ~/Downloads
-shasum -a 256 -c DeepSeek-Harness-v2.7.0-macOS-arm64.dmg.sha256
+shasum -a 256 -c DeepSeek-Harness-v3.0.0-macOS-arm64.dmg.sha256
 ```
 
 本地构建与验证：
@@ -207,4 +222,4 @@ shasum -a 256 -c DeepSeek-Harness-v2.7.0-macOS-arm64.dmg.sha256
 
 ---
 
-<p align="center"><sub><a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/tag/v2.7.0">v2.7.0</a> · <a href="./CHANGELOG.md">更新历史</a> · DSH 0.1.0-rc.6 · arm64 · <a href="./LICENSE">MIT</a> · <a href="./NOTICE.md">NOTICE</a> · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/issues">Issues</a></sub></p>
+<p align="center"><sub><a href="https://github.com/FlyXingByte/deepseek-harness-macos/releases/tag/v3.0.0">v3.0.0</a> · <a href="./CHANGELOG.md">更新历史</a> · DSH 0.1.2-alpha.3 · arm64 · <a href="./LICENSE">MIT</a> · <a href="./NOTICE.md">NOTICE</a> · <a href="https://github.com/FlyXingByte/deepseek-harness-macos/issues">Issues</a></sub></p>

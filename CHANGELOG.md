@@ -4,6 +4,28 @@
 
 ---
 
+## v3.0.0
+
+主版本升级：完整支持官方 `@deepseek-ai/dsh@0.1.2-alpha.3`，并为本机浏览器认证、自动回退和新版数据布局建立新的兼容边界。
+
+## 变更
+
+- 新增默认 `latest/next` 与 Alpha 实验更新通道；实验版不再被默认通道静默选中。
+- 默认推荐内核更新为 `0.1.2-alpha.3`，已验证回退点为 `0.1.1-rc.2`，历史最低仍保留到 `0.1.0-rc.6`。
+- 捕获官方 `dsh web` 输出的本次启动认证 URL，让 `WKWebView` 完成 303 和 HttpOnly Cookie 交换。
+- 新版未通过最终页面和 HTTP 200 验证时自动恢复上一个已知可用内核。
+- 归档清理兼容 alpha.3 的 `storages/session_projcache/sessions/<id>.json` 逐会话缓存，同时继续修剪旧 `session_projcache.json`，避免旧记录再次 bootstrap。
+
+## 安全与兼容
+
+- 认证 URL 只接受精确的 `http://127.0.0.1:3080/`、单个 43 字符令牌；令牌只留在内存，所有日志写入统一脱敏。
+- 裸根返回官方 401 时识别为“外部鉴权服务”，不再误启第二个进程；未知端口占用同样 fail closed。
+- Workspace 必须是官方 v2、旧投影缓存必须是 v3；未知未来格式、软链接和不符合层级的路径均拒绝清理。
+- 清理前必须成功备份 `workspace.json`、旧 cache 和本次目标的 v4 cache records；备份失败时零删除、零改写。
+- 官方 alpha.3 已移除可选 SQLite Session 后端；默认 JSONL 不受影响，自定义 SQLite Profile 需在旧版导出。
+
+---
+
 ## v2.7.0
 
 归档之后，可以真正删除。
